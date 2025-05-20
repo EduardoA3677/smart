@@ -1078,7 +1078,8 @@ def edit_commit_before_applying(commit):
         for a in archivos:
             print(Fore.CYAN + f" - {a}")
         # Llama al editor pasando la lista de archivos para que se abran en buffers (por ejemplo, en nvim).
-        subprocess.run([editor_cmd] + archivos)
+        # Usamos shell=False para evitar problemas de interpretación de argumentos
+        subprocess.run([editor_cmd] + archivos, shell=False)
     else:
         print(Fore.YELLOW + "No se encontraron archivos modificados para editar.")
 
@@ -1089,7 +1090,8 @@ def edit_commit_before_applying(commit):
         temp_msg_file = msg_file.name
 
     print(Fore.YELLOW + f"Abriendo el editor ({editor_cmd}) para editar el mensaje del commit...")
-    subprocess.run([editor_cmd, temp_msg_file])
+    # Usamos shell=False para evitar problemas de interpretación de argumentos
+    subprocess.run([editor_cmd, temp_msg_file], shell=False)
 
     # Agrega todos los cambios y crea el commit utilizando el mensaje editado.
     subprocess.run("git add .", shell=True)
@@ -1691,7 +1693,7 @@ def ask_file_renames_from_errors(failed_files):
                             # Intentar obtener contenido del archivo desde el commit a aplicar
                             content = run(f"git show MERGE_HEAD:{archivo}", allow_fail=True)
                             if content:
-                                # Crear directorios si es necesario
+                                # Crear directorios si es necesario - solo los que son necesarios
                                 os.makedirs(os.path.dirname(archivo), exist_ok=True)
                                 # Escribir el archivo
                                 with open(archivo, "w") as f:
@@ -1769,24 +1771,31 @@ def apply_patch_with_rename_handling(commit):
     
     # Aplicar los renombres a los archivos primero
     for origen, destino in file_renames.items():
-        # Verificar si el archivo destino ya existe
+        # Verificar si el archivo destino ya existe y origen no existe
         if os.path.exists(destino) and not os.path.exists(origen):
-            log_message(f"Creando enlace simbólico para renombre: {origen} -> {destino}", "INFO")
+            # Verificar si es un caso de modify/delete consultando git status
+            git_status = run("git status", allow_fail=True)
+            is_modify_delete = (f"{origen} deleted in HEAD" in git_status or 
+                                f"CONFLICT (modify/delete): {origen}" in git_status)
             
-            # Crear directorios si no existen
-            os.makedirs(os.path.dirname(origen), exist_ok=True)
-            
-            # En sistemas Unix, podemos crear un enlace simbólico
-            try:
-                if os.name == 'posix':
-                    # Crear un enlace simbólico
-                    run(f"ln -sf {destino} {origen}", allow_fail=True)
-                else:
-                    # En otros sistemas, copiar el archivo
-                    import shutil
-                    shutil.copy2(destino, origen)
-            except Exception as e:
-                log_message(f"Error al crear enlace para renombre: {str(e)}", "ERROR")
+            # Solo crear el enlace si NO es un caso de modify/delete (queremos preservar la eliminación)
+            if not is_modify_delete:
+                log_message(f"Creando enlace simbólico para renombre: {origen} -> {destino}", "INFO")
+                
+                # Crear directorios si no existen
+                os.makedirs(os.path.dirname(origen), exist_ok=True)
+                
+                # En sistemas Unix, podemos crear un enlace simbólico
+                try:
+                    if os.name == 'posix':
+                        # Crear un enlace simbólico
+                        run(f"ln -sf {destino} {origen}", allow_fail=True)
+                    else:
+                        # En otros sistemas, copiar el archivo
+                        import shutil
+                        shutil.copy2(destino, origen)
+                except Exception as e:
+                    log_message(f"Error al crear enlace para renombre: {str(e)}", "ERROR")
     
     # Intentar aplicar el cherry-pick directamente, sin hacer commit
     cherry_result = run(f"git cherry-pick --no-commit {commit_ref} 2>&1", allow_fail=True)
@@ -1924,12 +1933,24 @@ def apply_patch_with_rename_handling(commit):
     run("git cherry-pick --abort", allow_fail=True)
     
     # Para archivos eliminados en HEAD pero modificados en el commit, intentar recrearlos
+    # solo si así se ha indicado en la configuración
+    modify_delete_files = []
+    for line in run("git status -s", allow_fail=True).splitlines():
+        if "DU" in line or "UD" in line:  # DU = deleted by us, UD = deleted by them
+            parts = line.split()
+            if len(parts) >= 2:
+                file_path = " ".join(parts[1:])
+                modify_delete_files.append(file_path)
+    
     for origen, destino in file_renames.items():
+        # Ignorar explícitamente archivos marcados como eliminados
         if destino == "/dev/null":
             log_message(f"Ignorando archivo eliminado: {origen}", "INFO")
             continue
-            
-        if not os.path.exists(origen) and os.path.exists(destino):
+        
+        # Recrear solo los archivos que explícitamente se indicaron para recrear
+        # y que no son casos de modify/delete (ya eliminados)
+        if not os.path.exists(origen) and os.path.exists(destino) and origen not in modify_delete_files:
             log_message(f"Creando enlace para renombre: {origen} -> {destino}", "INFO")
             try:
                 # Crear directorio si no existe
@@ -2034,7 +2055,10 @@ def get_preferred_editor():
     return os.environ.get("EDITOR", "vi")
 
 def resume_cherry_pick(conflicted_files):
-
+    """
+    Abre los archivos con conflictos en el editor para permitir su edición manual.
+    Luego continúa el proceso de cherry-pick una vez resueltos los conflictos.
+    """
     if not conflicted_files:
         conflicted_files = run("git diff --name-only --diff-filter=U").splitlines()
 
@@ -2044,23 +2068,148 @@ def resume_cherry_pick(conflicted_files):
 
     editor_cmd = get_preferred_editor()
 
-    print(Fore.YELLOW + f"Se abrirán {len(conflicted_files)} archivos CON CONFLICTOS uno a la vez.")
-
-    for i, file in enumerate(conflicted_files, 1):
-        print(Fore.CYAN + f"\nAbriendo archivo {i}/{len(conflicted_files)}: {file}")
-        print(Fore.CYAN + "Edita el archivo para resolver los conflictos y guárdalo con :wq")
-
-        subprocess.run(f"{editor_cmd} {file}", shell=True)
-
+    # Comprobar si hay conflictos de tipo modify/delete
+    git_status = run("git status -s", allow_fail=True)
+    modify_delete_files = []
+    
+    for line in git_status.splitlines():
+        if "DU" in line or "UD" in line:  # DU = deleted by us, UD = deleted by them
+            parts = line.split()
+            if len(parts) >= 2:
+                file_path = " ".join(parts[1:])
+                modify_delete_files.append(file_path)
+    
+    # Separar archivos normales y modify/delete para tratarlos de forma diferente
+    normal_files = [f for f in conflicted_files if f not in modify_delete_files]
+    
+    # Primero mostrar información al usuario
+    if normal_files:
+        print(Fore.YELLOW + f"\nArchivos con conflictos normales ({len(normal_files)}):")
+        for file in normal_files:
+            print(Fore.YELLOW + f" - {file}")
+    
+    if modify_delete_files:
+        print(Fore.YELLOW + f"\nArchivos con conflictos modify/delete ({len(modify_delete_files)}):")
+        for file in modify_delete_files:
+            print(Fore.RED + f" - {file} (modify/delete)")
+            print(Fore.CYAN + "   Este archivo fue eliminado en HEAD pero modificado en el commit.")
+            print(Fore.CYAN + "   Opciones: 'git add' para mantenerlo, 'git rm' para eliminarlo.")
+    
+    # Preguntar al usuario si quiere abrir todos los archivos de una vez
+    open_all = False
+    if len(normal_files) > 1:
         if auto_mode:
-            subprocess.run(f"git add {file}", shell=True)
-            log_message(f"Archivo '{file}' añadido automáticamente.", "INFO")
+            open_all = False  # En modo auto preferimos uno a uno
         else:
-            add_now = input(Fore.CYAN + f"¿Deseas añadir '{file}' ahora con 'git add'? (s/n): ").lower()
-            if add_now.startswith('s'):
-                subprocess.run(f"git add {file}", shell=True)
-                log_message(f"Archivo '{file}' añadido correctamente.", "SUCCESS")
+            choice = input(Fore.CYAN + "¿Deseas abrir todos los archivos conflictivos a la vez en nvim? (s/n): ").lower()
+            open_all = choice.startswith('s')
+    
+    # Manejar archivos normales
+    if normal_files:
+        if open_all:
+            # Abrir todos los archivos a la vez
+            print(Fore.CYAN + f"\nAbriendo {len(normal_files)} archivos con conflictos en {editor_cmd}...")
+            subprocess.run([editor_cmd] + normal_files, shell=False)
+            
+            # Preguntar si añadir todos los archivos
+            if auto_mode:
+                for file in normal_files:
+                    subprocess.run(f"git add {file}", shell=True)
+                    log_message(f"Archivo '{file}' añadido automáticamente.", "INFO")
+            else:
+                add_all = input(Fore.CYAN + "¿Añadir todos los archivos resueltos a git? (s/n): ").lower()
+                if add_all.startswith('s'):
+                    for file in normal_files:
+                        subprocess.run(f"git add {file}", shell=True)
+                        log_message(f"Archivo '{file}' añadido.", "SUCCESS")
+        else:
+            # Abrir archivos uno a uno
+            print(Fore.YELLOW + f"Se abrirán {len(normal_files)} archivos con conflictos uno a la vez.")
+            for i, file in enumerate(normal_files, 1):
+                print(Fore.CYAN + f"\nAbriendo archivo {i}/{len(normal_files)}: {file}")
+                print(Fore.CYAN + "Edita el archivo para resolver los conflictos y guárdalo con :wq")
+                
+                # Usar lista de argumentos para evitar problemas de shell
+                subprocess.run([editor_cmd, file], shell=False)
+                
+                if auto_mode:
+                    subprocess.run(f"git add {file}", shell=True)
+                    log_message(f"Archivo '{file}' añadido automáticamente.", "INFO")
+                else:
+                    add_now = input(Fore.CYAN + f"¿Deseas añadir '{file}' con 'git add'? (s/n): ").lower()
+                    if add_now.startswith('s'):
+                        subprocess.run(f"git add {file}", shell=True)
+                        log_message(f"Archivo '{file}' añadido correctamente.", "SUCCESS")
+    
+    # Manejar archivos modify/delete
+    if modify_delete_files:
+        print(Fore.YELLOW + f"\nManejando {len(modify_delete_files)} archivos con conflicto modify/delete:")
+        for i, file in enumerate(modify_delete_files, 1):
+            print(Fore.CYAN + f"\nArchivo {i}/{len(modify_delete_files)}: {file}")
+            
+            # Obtener contenido del archivo desde MERGE_HEAD
+            content = run(f"git show MERGE_HEAD:{file}", allow_fail=True)
+            if content:
+                print(Fore.CYAN + "Este archivo tiene contenido en el commit que estás aplicando.")
+                
+                if auto_mode:
+                    # En modo automático, preferimos recrear el archivo
+                    os.makedirs(os.path.dirname(file), exist_ok=True)
+                    with open(file, "w") as f:
+                        f.write(content)
+                    run(f"git add {file}", allow_fail=True)
+                    log_message(f"Archivo recreado y añadido automáticamente: {file}", "INFO")
+                else:
+                    # Mostrar contenido al usuario
+                    print(Fore.CYAN + "Contenido del archivo en el commit (primeras 5 líneas):")
+                    for j, line in enumerate(content.splitlines()[:5]):
+                        print(Fore.WHITE + f"    {line}")
+                    if len(content.splitlines()) > 5:
+                        print(Fore.WHITE + "    ...")
+                    
+                    # Preguntar qué hacer
+                    options = [
+                        "Recrear el archivo con este contenido",
+                        "Abrir el contenido en el editor para revisarlo",
+                        "Ignorar los cambios (mantener el archivo eliminado)",
+                        "Continuar sin decidir ahora"
+                    ]
+                    choice = select_option(options, "¿Qué deseas hacer? ")
+                    
+                    if choice.startswith("Recrear"):
+                        # Recrear el archivo
+                        os.makedirs(os.path.dirname(file), exist_ok=True)
+                        with open(file, "w") as f:
+                            f.write(content)
+                        run(f"git add {file}", allow_fail=True)
+                        log_message(f"Archivo recreado: {file}", "SUCCESS")
+                    
+                    elif choice.startswith("Abrir"):
+                        # Crear archivo y abrirlo en el editor
+                        os.makedirs(os.path.dirname(file), exist_ok=True)
+                        with open(file, "w") as f:
+                            f.write(content)
+                        
+                        # Abrir en el editor
+                        subprocess.run([editor_cmd, file], shell=False)
+                        
+                        add_file = input(Fore.CYAN + f"¿Añadir el archivo '{file}' a git? (s/n): ").lower()
+                        if add_file.startswith('s'):
+                            run(f"git add {file}", allow_fail=True)
+                            log_message(f"Archivo añadido: {file}", "SUCCESS")
+                        else:
+                            run(f"git rm {file}", allow_fail=True)
+                            log_message(f"Archivo eliminado: {file}", "INFO")
+                    
+                    elif choice.startswith("Ignorar"):
+                        # Mantener el archivo eliminado
+                        run(f"git rm {file}", allow_fail=True)
+                        log_message(f"Archivo eliminado: {file}", "INFO")
+            else:
+                log_message(f"No se pudo obtener contenido para {file}", "WARNING")
+                run(f"git rm {file}", allow_fail=True)
 
+    # Verificar si quedan conflictos sin resolver
     remaining = run("git diff --name-only --diff-filter=U").splitlines()
     if remaining:
         print(Fore.YELLOW + f"Todavía quedan {len(remaining)} archivos con conflictos sin resolver:")
@@ -2074,9 +2223,13 @@ def resume_cherry_pick(conflicted_files):
             resolve_rest = input(Fore.CYAN + "¿Quieres resolver estos archivos también? (s/n): ").lower()
             if resolve_rest.startswith('s'):
                 return resume_cherry_pick(remaining)
+            else:
+                log_message("Existen conflictos sin resolver. El cherry-pick no puede continuar.", "WARNING")
+                return False
 
     print(Fore.GREEN + "\nTodos los conflictos parecen resueltos.")
 
+    # Añadir cualquier cambio restante
     if auto_mode:
         subprocess.run("git add .", shell=True)
         log_message("Se añadieron todos los archivos automáticamente.", "INFO")
@@ -2085,6 +2238,7 @@ def resume_cherry_pick(conflicted_files):
         if add_all.startswith('s'):
             subprocess.run("git add .", shell=True)
 
+    # Continuar el cherry-pick
     print(Fore.GREEN + "Continuando cherry-pick...")
     result = subprocess.run("git cherry-pick --continue", shell=True)
 
