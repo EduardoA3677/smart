@@ -3,6 +3,7 @@ import tempfile
 import os
 import sys
 import json
+import csv
 import atexit
 import re
 import argparse
@@ -20,6 +21,7 @@ AUTHOR_MAP_CACHE = ".smart_cherry_pick_author_map.json"
 COMMITS_LIST_FILE = ".smart_cherry_pick_commits.json"
 LOG_FILE = ".smart_cherry_pick_log.txt"
 CONFIG_FILE = ".smart_cherry_pick_config.json"
+STATS_FILE = ".smart_cherry_pick_stats.csv"
 TEMP_FILES = [COMMIT_DEP_CACHE]
 
 cherry_pick_queue = []
@@ -39,6 +41,7 @@ dry_run = False
 start_time = time.time()
 processed_missing_files = set()  
 created_files = set()  
+stats_data = {}
 
 config = {
     "max_commits_display": 5,
@@ -48,7 +51,8 @@ config = {
     "auto_add_dependencies": False,
     "show_progress_bar": True,
     "max_retries": 3,
-    "retry_delay": 2,  
+    "retry_delay": 2,
+    "record_stats": True,
 }
 
 def clean_temp_files():
@@ -77,6 +81,88 @@ def log_message(message, level="INFO"):
         }
         color = level_colors.get(level, "")
         print(f"{color}[{level}] {message}")
+
+def init_stats_file():
+    if not config["record_stats"]:
+        return
+    
+    headers = [
+        "timestamp", 
+        "commit", 
+        "operation", 
+        "status", 
+        "duration_ms", 
+        "file_count",
+        "conflict_count", 
+        "resolution_method", 
+        "remote",
+        "auto_mode"
+    ]
+    
+    if not os.path.exists(STATS_FILE):
+        with open(STATS_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+
+def record_stats(commit, operation, status, duration_ms=0, file_count=0, 
+                conflict_count=0, resolution_method="", remote="", auto_mode=False):
+    if not config["record_stats"]:
+        return
+    
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    
+    with open(STATS_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            timestamp, 
+            commit, 
+            operation, 
+            status, 
+            duration_ms,
+            file_count, 
+            conflict_count, 
+            resolution_method,
+            remote, 
+            "true" if auto_mode else "false"
+        ])
+
+def start_operation_timer(commit, operation):
+    global stats_data
+    key = f"{commit}:{operation}"
+    stats_data[key] = {
+        "start_time": time.time(),
+        "file_count": 0,
+        "conflict_count": 0,
+        "resolution_method": ""
+    }
+    return key
+
+def end_operation_timer(key, status, resolution_method=""):
+    global stats_data
+    if key not in stats_data:
+        return
+    
+    data = stats_data[key]
+    duration_ms = int((time.time() - data["start_time"]) * 1000)
+    commit, operation = key.split(":", 1)
+    
+    # Actualizar con información de resolución si se proporcionó
+    if resolution_method:
+        data["resolution_method"] = resolution_method
+    
+    record_stats(
+        commit=commit,
+        operation=operation,
+        status=status,
+        duration_ms=duration_ms,
+        file_count=data["file_count"],
+        conflict_count=data["conflict_count"],
+        resolution_method=data["resolution_method"],
+        remote=remote_name or "",
+        auto_mode=auto_mode
+    )
+    
+    del stats_data[key]
 
 def load_config():
     global config
@@ -388,13 +474,31 @@ def find_commit_adding_file(file_path):
     return None
 
 def find_similar_files(file_path):
+    # Caché para evitar búsquedas repetidas
+    global similar_files_cache
+    if 'similar_files_cache' not in globals():
+        similar_files_cache = {}
+    
+    # Si ya buscamos este archivo antes, retornamos resultados en caché
+    if file_path in similar_files_cache:
+        return similar_files_cache[file_path]
+
     basename = os.path.basename(file_path)
     dirname = os.path.dirname(file_path)
 
     all_files = run("git ls-files").splitlines()
-
     similar_files = []
 
+    # Si el nombre de archivo tiene extensión, buscar también sin extensión
+    filebase, ext = os.path.splitext(basename)
+    if ext:
+        # Buscar archivos similares que podrían tener otra extensión
+        for repo_file in all_files:
+            repo_filebase, repo_ext = os.path.splitext(os.path.basename(repo_file))
+            if filebase == repo_filebase and ext != repo_ext:
+                similar_files.append((repo_file, 90))  # Alta similitud para mismo nombre con extensión diferente
+    
+    # Buscar por similitud de nombres
     for repo_file in all_files:
         repo_basename = os.path.basename(repo_file)
         repo_dirname = os.path.dirname(repo_file)
@@ -402,13 +506,31 @@ def find_similar_files(file_path):
         name_similarity = calculate_similarity(basename, repo_basename)
 
         if dirname == repo_dirname:
-            name_similarity += 20
+            name_similarity += 20  # Bonus por estar en el mismo directorio
+        
+        # Busca si están en directorios similares
+        dir_similarity = calculate_similarity(dirname, repo_dirname)
+        if dir_similarity > 70:  # Si los directorios son muy similares
+            name_similarity += 10
 
         if name_similarity >= config["rename_detection_threshold"]:
             similar_files.append((repo_file, name_similarity))
 
+    # Si no encontramos archivos similares, intentar búsqueda más exhaustiva
+    if len(similar_files) == 0 and len(filebase) > 3:
+        # Buscar archivos con nombres parciales (útil para renombres mayores)
+        for repo_file in all_files:
+            repo_basename = os.path.basename(repo_file)
+            if len(filebase) > 5 and (filebase[:5] in repo_basename or filebase[-5:] in repo_basename):
+                similar_files.append((repo_file, 60))  # Similitud media para coincidencias parciales
+    
+    # Ordenar por similaridad y limitar resultados
     similar_files.sort(key=lambda x: x[1], reverse=True)
-    return similar_files[:5]  
+    results = similar_files[:5]
+    
+    # Guardar en caché
+    similar_files_cache[file_path] = results
+    return results
 
 def calculate_similarity(str1, str2):
     if not str1 or not str2:
@@ -473,6 +595,7 @@ def find_file_history(file_path):
     return run(cmd)
 
 def get_blame_and_grep_dependencies(commit, file, dep_cache=None):
+    # Usar caché para evitar análisis repetitivos
     cache_key = f"{commit}:{file}"
     if dep_cache is not None and cache_key in dep_cache:
         return dep_cache[cache_key]
@@ -480,6 +603,7 @@ def get_blame_and_grep_dependencies(commit, file, dep_cache=None):
     remote_ref = f"{remote_name}/" if remote_name else ""
     commit_ref = f"{remote_ref}{commit}" if remote_name else commit
 
+    # Obtener el contenido del archivo
     try:
         file_content = run(f"git show {commit}:{file}")
     except Exception:
@@ -489,7 +613,12 @@ def get_blame_and_grep_dependencies(commit, file, dep_cache=None):
         return []
 
     lines = file_content.splitlines()
-
+    
+    # Detectar el tipo de archivo para análisis específico de lenguaje
+    _, extension = os.path.splitext(file)
+    extension = extension.lower()
+    
+    # Analizar el blame para identificar commits que modificaron el archivo
     try:
         blame_cmd = f"git blame --porcelain {file}"
         if remote_name:
@@ -502,47 +631,149 @@ def get_blame_and_grep_dependencies(commit, file, dep_cache=None):
     blame_commits = set()
     if blame_output:
         for line in blame_output.splitlines():
-            if line and len(line.split()) == 4 and len(line.split()[0]) == 40:
+            if line and len(line.split()) >= 1 and len(line.split()[0]) == 40:  # 40 caracteres = hash SHA-1
                 blame_commits.add(line.split()[0])
 
+    # Iniciar la lista de commits sospechosos con los del blame
     suspects = set(blame_commits)
-
+    
+    # Análisis específico por tipo de archivo/lenguaje
+    language_patterns = {
+        ".py": {
+            "imports": [
+                r'import\s+([a-zA-Z0-9_.]+)',
+                r'from\s+([a-zA-Z0-9_.]+)\s+import',
+            ],
+            "functions": [
+                r'def\s+([a-zA-Z0-9_]+)\s*\(',
+                r'([a-zA-Z0-9_]+)\s*\('
+            ]
+        },
+        ".js": {
+            "imports": [
+                r'import\s+.*\s+from\s+[\'"]([^\'"]+)[\'"]',
+                r'require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)',
+            ],
+            "functions": [
+                r'function\s+([a-zA-Z0-9_]+)\s*\(',
+                r'const\s+([a-zA-Z0-9_]+)\s*=\s*\(',
+                r'let\s+([a-zA-Z0-9_]+)\s*=\s*\(',
+                r'var\s+([a-zA-Z0-9_]+)\s*=\s*\(',
+                r'([a-zA-Z0-9_]+)\s*:\s*function'
+            ]
+        },
+        ".c": {
+            "imports": [
+                r'#\s*include\s*[<"]([^>"]+)[>"]',
+            ],
+            "functions": [
+                r'([a-zA-Z0-9_]+)\s*\(',
+                r'typedef\s+struct\s+([a-zA-Z0-9_]+)'
+            ]
+        },
+        ".cpp": {
+            "imports": [
+                r'#\s*include\s*[<"]([^>"]+)[>"]',
+            ],
+            "functions": [
+                r'([a-zA-Z0-9_:]+)::[a-zA-Z0-9_]+\s*\(',
+                r'([a-zA-Z0-9_]+)\s*\(',
+                r'class\s+([a-zA-Z0-9_]+)'
+            ]
+        },
+        ".h": {
+            "imports": [
+                r'#\s*include\s*[<"]([^>"]+)[>"]',
+            ],
+            "functions": [
+                r'([a-zA-Z0-9_]+)\s*\(',
+                r'typedef\s+struct\s+([a-zA-Z0-9_]+)',
+                r'class\s+([a-zA-Z0-9_]+)'
+            ]
+        },
+        ".java": {
+            "imports": [
+                r'import\s+([a-zA-Z0-9_.]+)',
+            ],
+            "functions": [
+                r'([a-zA-Z0-9_]+)\s*\(',
+                r'class\s+([a-zA-Z0-9_]+)',
+                r'interface\s+([a-zA-Z0-9_]+)'
+            ]
+        }
+    }
+    
+    # Si no hay un patrón específico para la extensión, usar uno genérico
+    if extension not in language_patterns:
+        patterns = {
+            "functions": [r'([a-zA-Z0-9_]+)\s*\(']
+        }
+    else:
+        patterns = language_patterns[extension]
+    
+    # Extraer funciones y símbolos importantes
+    important_symbols = set()
     for i, line in enumerate(lines):
         line = line.strip()
+        
+        # Ignorar líneas vacías o comentarios
         if not line or line.startswith("//") or line.startswith("#"):
             continue
+            
+        # Buscar símbolos y funciones según el tipo de archivo
+        for pattern_type, pattern_list in patterns.items():
+            for pattern in pattern_list:
+                matches = re.findall(pattern, line)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        match = match[0]  # En caso de que el regex devuelva grupos
+                    if match and len(match) > 1:  # Ignore symbols that are too short
+                        important_symbols.add(match)
+    
+    # Buscar commits asociados a los símbolos importantes
+    for symbol in important_symbols:
+        # Buscar sólo símbolos significativos
+        if len(symbol) < 3 or not symbol.isidentifier():
+            continue
+            
+        grep_cmd = f"git log -S'{symbol}' --pretty=format:'%H' -- {file}"
+        if remote_name:
+            grep_cmd = f"git log -S'{symbol}' --pretty=format:'%H' {remote_name} -- {file}"
 
-        if "(" in line and ")" in line:
-            pre_paren = line.split("(")[0].strip()
-            if pre_paren:
-                pre_split = pre_paren.split()
-                if pre_split:
-
-                    fname = pre_split[-1]
-                    if fname.isidentifier():
-
-                        grep_cmd = f"git log -S'{fname}' --pretty=format:'%H' -- {file}"
-                        if remote_name:
-                            grep_cmd = f"git log -S'{fname}' --pretty=format:'%H' {remote_name} -- {file}"
-
-                        grep_result = run(grep_cmd)
-                        if grep_result:
-                            suspects.update(grep_result.splitlines())
-
+        grep_result = run(grep_cmd)
+        if grep_result:
+            suspects.update(grep_result.splitlines())
+    
+    # Analizar dependencias de archivos incluidos
     includes = extract_includes(file_content)
     for include_file in includes:
         try:
-
             include_commit = find_commit_adding_file(include_file)
             if include_commit:
                 suspects.add(include_commit)
         except Exception:
             pass
 
-    suspects = list(suspects)
+    # Verificar si hay rename_dependencies especiales (para refactors)
+    rename_grep_cmd = f"git log --name-status --format='%H' -M -C -- {file}"
+    if remote_name:
+        rename_grep_cmd = f"git log --name-status --format='%H' -M -C {remote_name} -- {file}"
+    
+    rename_output = run(rename_grep_cmd)
+    if rename_output:
+        for line in rename_output.splitlines():
+            if len(line) == 40:  # Hash SHA-1
+                suspects.add(line)
+    
+    # Eliminar el commit actual de la lista de dependencias
+    if commit in suspects:
+        suspects.remove(commit)
+        
+    # Convertir a lista para almacenar en caché
+    suspects_list = list(suspects)
     if dep_cache is not None:
-        dep_cache[cache_key] = suspects
-    return suspects
+        dep_cache[cache_key] = suspects_list
+    return suspects_list
 
 def extract_includes(file_content):
     includes = []
@@ -768,7 +999,7 @@ def load_file_renames():
 
 def process_commit(commit, dep_cache):
     print(Fore.GREEN + f"\nProcesando commit: {get_commit_context(commit)}")
-
+    
     if auto_mode:
         log_message("Modo automático: analizando commit para buscar dependencias", "INFO")
         analyze_commit(commit, dep_cache)
@@ -777,7 +1008,8 @@ def process_commit(commit, dep_cache):
     options = [
         "Analizar commit para buscar dependencias",
         "Aplicar cherry-pick directamente sin análisis",
-        "Editar el contenido y mensaje del commit antes de aplicarlo"
+        "Editar el contenido y mensaje del commit antes de aplicarlo",
+        "Omitir este commit"
     ]
     choice = select_option(options, "¿Cómo deseas procesar este commit? ")
 
@@ -785,30 +1017,41 @@ def process_commit(commit, dep_cache):
         analyze_commit(commit, dep_cache)
     elif choice.startswith("Aplicar"):
         print(Fore.GREEN + f"\nAplicando cherry-pick directamente para {commit}...")
-
+        
         if dry_run:
             print(Fore.YELLOW + f"[Modo simulación] Se aplicaría cherry-pick a {commit}")
             final_commits.append(commit)
             return
 
+        op_key = start_operation_timer(commit, "direct_cherry_pick")
+        
+        # Preparar la referencia del commit
         commit_ref = commit
         if remote_name:
             remote_ref = f"{remote_name}/{commit}"
             test_exists = run(f"git rev-parse --verify {remote_ref}^{{commit}} 2>/dev/null", allow_fail=True)
             if test_exists:
                 commit_ref = remote_ref
-
+        
+        # Intentar aplicar el cherry-pick
+        start_time = time.time()
         result = subprocess.run(f"git cherry-pick --empty=drop {commit_ref}", shell=True)
-
+        duration = time.time() - start_time
+        
+        # Manejar el resultado
         if result.returncode == 0:
             applied_commits.add(commit)
             final_commits.append(commit)
-            print(Fore.GREEN + f"Commit {commit} aplicado exitosamente.")
+            print(Fore.GREEN + f"Commit {commit} aplicado exitosamente en {duration:.2f} segundos.")
+            end_operation_timer(op_key, "success")
         else:
             log_message(f"Error al aplicar cherry-pick directo para {commit}", "WARNING")
             handle_cherry_pick_error(commit)
     elif choice.startswith("Editar"):
         edit_commit_before_applying(commit)
+    else:  # Omitir commit
+        skipped_commits.add(commit)
+        log_message(f"Commit {commit} omitido por elección del usuario.", "INFO")
 
 def edit_commit_before_applying(commit):
     commit_ref = commit
@@ -899,11 +1142,12 @@ def ask_to_proceed():
             break
 
 def apply_commits_in_order():
-
+    # Asegurar que todos los commits iniciales estén incluidos
     for commit in initial_commits:
         if commit not in final_commits and commit not in skipped_commits:
             final_commits.append(commit)
 
+    # Crear una lista ordenada de commits únicos
     unique_commits = OrderedDict()
     for commit in final_commits:
         if commit not in unique_commits and commit not in skipped_commits:
@@ -920,42 +1164,78 @@ def apply_commits_in_order():
         return
 
     total_commits = len(commit_list)
+    batch_size = 10  # Procesar commits en lotes para mejorar rendimiento en proyectos grandes
     success_count = 0
     fail_count = 0
+    
+    # Estadísticas globales
+    global_stats_key = start_operation_timer("batch", "apply_all_commits")
+    if global_stats_key in stats_data:
+        stats_data[global_stats_key]["file_count"] = total_commits
+    
+    for batch_start in range(0, total_commits, batch_size):
+        batch_end = min(batch_start + batch_size, total_commits)
+        batch = commit_list[batch_start:batch_end]
+        
+        print(Fore.CYAN + f"\nProcesando lote {batch_start//batch_size + 1}/{(total_commits+batch_size-1)//batch_size} ({batch_end-batch_start} commits)")
+        
+        for idx, commit in enumerate(batch):
+            overall_idx = batch_start + idx
+            show_progress(overall_idx + 1, total_commits, "Aplicando commits")
 
-    for idx, commit in enumerate(commit_list):
-        show_progress(idx + 1, total_commits, "Aplicando commits")
+            if commit in applied_commits:
+                log_message(f"Commit {commit} ya fue aplicado previamente. Saltando.", "INFO")
+                success_count += 1
+                continue
 
-        if commit in applied_commits:
-            log_message(f"Commit {commit} ya fue aplicado previamente. Saltando.", "INFO")
-            success_count += 1
-            continue
+            if commit in skipped_commits:
+                log_message(f"Commit {commit} está en la lista de commits a omitir. Saltando.", "INFO")
+                continue
 
-        if commit in skipped_commits:
-            log_message(f"Commit {commit} está en la lista de commits a omitir. Saltando.", "INFO")
-            continue
+            log_message(f"Aplicando cherry-pick para {commit}", "INFO")
+            op_key = start_operation_timer(commit, "cherry_pick")
 
-        log_message(f"Aplicando cherry-pick para {commit}", "INFO")
+            # Preparar la referencia del commit
+            commit_ref = commit
+            if remote_name:
+                remote_ref = f"{remote_name}/{commit}"
+                test_exists = run(f"git rev-parse --verify {remote_ref}^{{commit}} 2>/dev/null", allow_fail=True)
+                if test_exists:
+                    commit_ref = remote_ref
 
-        commit_ref = commit
-        if remote_name:
-            remote_ref = f"{remote_name}/{commit}"
-            test_exists = run(f"git rev-parse --verify {remote_ref}^{{commit}} 2>/dev/null", allow_fail=True)
-            if test_exists:
-                commit_ref = remote_ref
+            # Intentar aplicar el commit
+            print(Fore.GREEN + f"\n[{overall_idx+1}/{total_commits}] Aplicando cherry-pick --empty=drop {commit}...")
+            
+            # Verificar si es un proyecto grande y optimizar
+            if total_commits > 50:  # Para proyectos grandes
+                # Usamos --allow-empty para procesar rápidamente commits que podrían ser vacíos
+                result = subprocess.run(f"git cherry-pick --allow-empty --empty=drop {commit_ref}", shell=True)
+            else:
+                result = subprocess.run(f"git cherry-pick --empty=drop {commit_ref}", shell=True)
 
-        print(Fore.GREEN + f"\n[{idx+1}/{total_commits}] Aplicando cherry-pick --empty=drop {commit}...")
-        result = subprocess.run(f"git cherry-pick --empty=drop {commit_ref}", shell=True)
+            # Manejar el resultado
+            if result.returncode != 0:
+                fail_count += 1
+                end_operation_timer(op_key, "failure")
+                handle_cherry_pick_error(commit)
+            else:
+                applied_commits.add(commit)
+                success_count += 1
+                end_operation_timer(op_key, "success")
+                log_message(f"Commit {commit} aplicado exitosamente.", "SUCCESS")
+        
+        # Si estamos en un proyecto grande, guardar el progreso después de cada lote
+        if total_commits > 50:
+            save_history(applied_commits)
+            log_message(f"Progreso guardado: {success_count}/{total_commits} commits aplicados", "INFO")
 
-        if result.returncode != 0:
-            fail_count += 1
-            handle_cherry_pick_error(commit)
-            continue
-
-        applied_commits.add(commit)
-        success_count += 1
-        log_message(f"Commit {commit} aplicado exitosamente.", "SUCCESS")
-
+    # Finalizar estadísticas globales
+    if global_stats_key in stats_data:
+        stats_data[global_stats_key]["success_count"] = success_count
+        stats_data[global_stats_key]["fail_count"] = fail_count
+    end_operation_timer(global_stats_key, "completed")
+    
+    # Mostrar resumen
     print("\n" + "="*50)
     print(Fore.GREEN + f"Resumen de Cherry-pick:")
     print(Fore.GREEN + f"  Total commits procesados: {total_commits}")
@@ -978,11 +1258,42 @@ def parse_not_existing_files(error_output):
     return not_exist_files
 
 def handle_cherry_pick_error(commit):
+    op_key = start_operation_timer(commit, "error_resolution")
+    resolution_method = "manual"
+    
+    # Intenta resolver el error automáticamente en modo auto
+    if auto_mode:
+        # Primero intentamos con --strategy-option=theirs
+        log_message("Modo automático: intentando resolver conflictos con --strategy-option=theirs", "INFO")
+        run("git cherry-pick --abort", allow_fail=True)
+        result = subprocess.run(f"git cherry-pick --strategy-option=theirs {commit}", shell=True)
+        if result.returncode == 0:
+            applied_commits.add(commit)
+            resolution_method = "auto_theirs"
+            log_message(f"Commit {commit} aplicado automáticamente con estrategia 'theirs'", "SUCCESS")
+            end_operation_timer(op_key, "success", resolution_method)
+            return
+
+        # Si falla, intentamos con --strategy-option=ours
+        log_message("Falló resolución 'theirs', intentando con 'ours'", "INFO")
+        run("git cherry-pick --abort", allow_fail=True)
+        result = subprocess.run(f"git cherry-pick --strategy-option=ours {commit}", shell=True)
+        if result.returncode == 0:
+            applied_commits.add(commit)
+            resolution_method = "auto_ours"
+            log_message(f"Commit {commit} aplicado automáticamente con estrategia 'ours'", "SUCCESS")
+            end_operation_timer(op_key, "success", resolution_method)
+            return
+
     log_message(f"Error al aplicar el commit {commit}. Analizando conflictos...", "ERROR")
 
     error_output = run("git status 2>&1")
     not_exist_files = parse_not_existing_files(error_output)
     failed_files = run("git diff --name-only --diff-filter=U").splitlines()
+    
+    # Actualizar estadísticas con información de conflictos
+    if op_key in stats_data:
+        stats_data[op_key]["conflict_count"] = len(not_exist_files) + len(failed_files)
 
     if not_exist_files:
         print(Fore.YELLOW + f"Se encontraron {len(not_exist_files)} archivos que no existen en el índice:")
@@ -990,22 +1301,29 @@ def handle_cherry_pick_error(commit):
             print(Fore.YELLOW + f" - {f}")
 
         run("git cherry-pick --abort")
-
+        resolution_method = "missing_files_handling"
+        
+        missing_handled_count = 0
         for missing_file in not_exist_files:
-
             if not ask_to_search_file(missing_file):
                 log_message(f"Ignorando archivo faltante: {missing_file}", "WARNING")
                 continue
 
             adding_commit = find_commit_adding_file(missing_file)
-
             if adding_commit:
                 context = get_commit_context(adding_commit)
                 print(Fore.CYAN + f"\nEl archivo '{missing_file}' fue agregado originalmente en:\n  {context}")
 
-                handle_missing_file(missing_file, adding_commit, commit)
+                if handle_missing_file(missing_file, adding_commit, commit):
+                    missing_handled_count += 1
             else:
                 log_message(f"No se pudo encontrar el commit que agregó '{missing_file}'", "WARNING")
+
+        # Si no se pudo manejar ningún archivo faltante, terminar
+        if missing_handled_count == 0 and len(not_exist_files) > 0:
+            log_message("No se pudo manejar ningún archivo faltante", "ERROR")
+            end_operation_timer(op_key, "failure", resolution_method)
+            return
 
         print(Fore.GREEN + f"\nIntentando aplicar cherry-pick nuevamente para {commit}...")
 
@@ -1020,14 +1338,53 @@ def handle_cherry_pick_error(commit):
         if result.returncode == 0:
             applied_commits.add(commit)
             log_message(f"Commit {commit} aplicado exitosamente después de resolver archivos faltantes.", "SUCCESS")
+            end_operation_timer(op_key, "success", resolution_method)
         else:
             log_message(f"Todavía hay problemas al aplicar el commit. Puedes intentar manualmente.", "ERROR")
+            end_operation_timer(op_key, "failure", resolution_method)
 
     elif failed_files:
         print(Fore.YELLOW + f"Archivos con conflictos detectados ({len(failed_files)}):")
         for f in failed_files:
             print(Fore.YELLOW + f" - {f}")
 
+        # En modo auto, intentar resolver usando estrategias automáticas primero
+        if auto_mode:
+            log_message(f"Modo automático: intentando resolver {len(failed_files)} conflictos", "INFO")
+            resolution_method = "auto_conflict_resolution"
+            
+            # Primero intentamos usar git automáticamente
+            result = run("git -c core.editor=true merge --continue 2>&1", allow_fail=True)
+            if "use 'git add' to mark resolution" not in result:
+                # Intentar añadir todos los archivos automáticamente
+                for file in failed_files:
+                    run(f"git add {file}", allow_fail=True)
+                
+                result = run("git cherry-pick --continue 2>&1", allow_fail=True)
+                if "fixed-up" in result or "successfully" in result:
+                    applied_commits.add(commit)
+                    log_message(f"Conflictos resueltos automáticamente para {commit}", "SUCCESS")
+                    end_operation_timer(op_key, "success", resolution_method)
+                    return
+            
+            # Si eso falla, intentar manejar renombres
+            run("git cherry-pick --abort", allow_fail=True)
+            handled = True
+            for file in failed_files:
+                # Buscar archivo más similar
+                similar_files = find_similar_files(file)
+                if similar_files and similar_files[0][1] > 70:  # Si hay un archivo similar con score > 70
+                    file_renames[file] = similar_files[0][0]
+                    log_message(f"Auto-renombramiento: {file} -> {similar_files[0][0]}", "INFO")
+                else:
+                    handled = False
+            
+            if handled:
+                if apply_patch_with_rename_handling(commit):
+                    end_operation_timer(op_key, "success", "auto_rename_handling")
+                    return
+        
+        # Si el modo auto falló o no estamos en modo auto
         options = [
             "Resolver conflictos manualmente", 
             "Intentar manejo automático de archivos renombrados", 
@@ -1036,24 +1393,35 @@ def handle_cherry_pick_error(commit):
         choice = select_option(options)
 
         if choice.startswith("Resolver"):
-
-            resume_cherry_pick(failed_files)
+            resolution_method = "manual_conflict_resolution"
+            if resume_cherry_pick(failed_files):
+                applied_commits.add(commit)
+                end_operation_timer(op_key, "success", resolution_method)
+            else:
+                end_operation_timer(op_key, "failure", resolution_method)
         elif choice.startswith("Intentar"):
-
+            resolution_method = "manual_rename_handling"
             run("git cherry-pick --abort")
             handled = ask_file_renames_from_errors(failed_files)
             if handled:
-                apply_patch_with_rename_handling(commit)
+                if apply_patch_with_rename_handling(commit):
+                    applied_commits.add(commit)
+                    end_operation_timer(op_key, "success", resolution_method)
+                else:
+                    end_operation_timer(op_key, "failure", resolution_method)
             else:
                 log_message("No se pudo manejar los renombres. Saltando commit.", "ERROR")
+                end_operation_timer(op_key, "failure", resolution_method)
         else:
-
+            resolution_method = "aborted"
             run("git cherry-pick --abort")
             log_message(f"Cherry-pick abortado para el commit {commit}.", "WARNING")
+            end_operation_timer(op_key, "aborted", resolution_method)
     else:
-
+        resolution_method = "unknown_error"
         run("git cherry-pick --abort")
         log_message(f"Cherry-pick fallido pero no se detectaron conflictos. Saltando commit.", "ERROR")
+        end_operation_timer(op_key, "failure", resolution_method)
 
 def get_current_branch():
     return subprocess.run(
@@ -1063,25 +1431,47 @@ def get_current_branch():
 
 def get_file_content_at_commit(file_path, commit, branch_name):
 
+    branch_name = branch_name or get_current_branch()
+    if verbose_mode:
+        print(f"Rama actual: {branch_name}")
+    
+    # Intenta obtener el contenido directamente
     content = run(f"git show {commit}:{file_path}", allow_fail=True)
-    branch_name = get_current_branch()
-    print(f"Rama actual: {branch_name}")
-
     if content:
        return content  
-
+    
+    # Si hay un remote, intenta obtenerlo desde allí
     if remote_name:
         if verbose_mode:
             log_message(f"Intentando obtener {file_path} de {commit} vía remote {remote_name}", "DEBUG")
 
+        # Intenta hacer fetch del commit específico
         run(f"git fetch {remote_name} {commit}", allow_fail=True)
-
-        content = run(f"git show {commit}:{file_path}", allow_fail=True)
+        
+        # Intenta con la referencia remota completa
+        remote_commit = f"{remote_name}/{commit}"
+        content = run(f"git show {remote_commit}:{file_path}", allow_fail=True)
         if content:
-           return content  
+           return content
+           
+        # Intenta buscar en otras ramas remotas
+        remote_branches = run(f"git branch -r | grep {remote_name}/", allow_fail=True).splitlines()
+        for remote_branch in remote_branches:
+            content = run(f"git show {remote_branch}:{file_path}", allow_fail=True)
+            if content:
+                log_message(f"Archivo encontrado en rama remota: {remote_branch}", "INFO")
+                return content
 
-        log_message(f"No se pudo obtener contenido de {file_path} en commit {commit}", "WARNING")
-
+    # Busca en commits recientes
+    recent_commits = run(f"git log -n 50 --pretty=format:'%H'", allow_fail=True).splitlines()
+    for recent_commit in recent_commits:
+        if recent_commit != commit:  # Evita intentar con el mismo commit
+            content = run(f"git show {recent_commit}:{file_path}", allow_fail=True)
+            if content:
+                log_message(f"Se encontró el archivo en un commit reciente: {recent_commit[:8]}", "INFO")
+                return content
+    
+    log_message(f"No se pudo obtener contenido de {file_path} en ninguna referencia", "WARNING")
     return None
 
 def handle_missing_file(missing_file, adding_commit, current_commit):
@@ -1151,7 +1541,7 @@ def handle_missing_file(missing_file, adding_commit, current_commit):
 
         try:
 
-            file_content = get_file_content_at_commit(missing_file, current_commit)
+            file_content = get_file_content_at_commit(missing_file, current_commit, get_current_branch())
             if file_content:
 
                 directory = os.path.dirname(missing_file)
@@ -1291,83 +1681,7 @@ def apply_patch_with_rename_handling(commit):
     log_message(f"Commit {commit} aplicado exitosamente con manejo de renombres.", "SUCCESS")
     return True
 
-def handle_cherry_pick_error(commit):
-    log_message(f"Error al aplicar el commit {commit}. Analizando conflictos...", "ERROR")
 
-    error_output = run("git status 2>&1")
-    not_exist_files = parse_not_existing_files(error_output)
-    failed_files = run("git diff --name-only --diff-filter=U").splitlines()
-
-    if not_exist_files:
-        print(Fore.YELLOW + f"Se encontraron {len(not_exist_files)} archivos que no existen en el índice:")
-        for f in not_exist_files:
-            print(Fore.YELLOW + f" - {f}")
-
-        run("git cherry-pick --abort")
-
-        for missing_file in not_exist_files:
-
-            if not ask_to_search_file(missing_file):
-                log_message(f"Ignorando archivo faltante: {missing_file}", "WARNING")
-                continue
-
-            adding_commit = find_commit_adding_file(missing_file)
-
-            if adding_commit:
-                context = get_commit_context(adding_commit)
-                print(Fore.CYAN + f"\nEl archivo '{missing_file}' fue agregado originalmente en:\n  {context}")
-
-                handle_missing_file(missing_file, adding_commit, commit)
-            else:
-                log_message(f"No se pudo encontrar el commit que agregó '{missing_file}'", "WARNING")
-
-        print(Fore.GREEN + f"\nIntentando aplicar cherry-pick nuevamente para {commit}...")
-
-        commit_ref = commit
-        if remote_name:
-            remote_ref = f"{remote_name}/{commit}"
-            test_exists = run(f"git rev-parse --verify {remote_ref}^{{commit}} 2>/dev/null", allow_fail=True)
-            if test_exists:
-                commit_ref = remote_ref
-
-        result = subprocess.run(f"git cherry-pick --empty=drop {commit_ref}", shell=True)
-        if result.returncode == 0:
-            applied_commits.add(commit)
-            log_message(f"Commit {commit} aplicado exitosamente después de resolver archivos faltantes.", "SUCCESS")
-        else:
-            log_message(f"Todavía hay problemas al aplicar el commit. Puedes intentar manualmente.", "ERROR")
-
-    elif failed_files:
-        print(Fore.YELLOW + f"Archivos con conflictos detectados ({len(failed_files)}):")
-        for f in failed_files:
-            print(Fore.YELLOW + f" - {f}")
-
-        options = [
-            "Resolver conflictos manualmente", 
-            "Intentar manejo automático de archivos renombrados", 
-            "Abortar cherry-pick"
-        ]
-        choice = select_option(options)
-
-        if choice.startswith("Resolver"):
-
-            resume_cherry_pick(failed_files)
-        elif choice.startswith("Intentar"):
-
-            run("git cherry-pick --abort")
-            handled = ask_file_renames_from_errors(failed_files)
-            if handled:
-                apply_patch_with_rename_handling(commit)
-            else:
-                log_message("No se pudo manejar los renombres. Saltando commit.", "ERROR")
-        else:
-
-            run("git cherry-pick --abort")
-            log_message(f"Cherry-pick abortado para el commit {commit}.", "WARNING")
-    else:
-
-        run("git cherry-pick --abort")
-        log_message(f"Cherry-pick fallido pero no se detectaron conflictos. Saltando commit.", "ERROR")
 
 def get_preferred_editor():
 
@@ -1490,16 +1804,17 @@ def get_commit_range(start_commit, end_commit):
 
 def show_help():
     print("Smart Cherry Pick - Herramienta para aplicar commits de manera inteligente")
-    print("Uso:")
-    print("  python3 smart_cherry_pick.py <commit_hash> [commit_hash2 ... commit_hashN] [opciones]")
-    print("  python3 smart_cherry_pick.py --range-commits <start_commit> <end_commit> [opciones]")
-    print("  python3 smart_cherry_pick.py --help")
-    print("Argumentos:")
+    print("\nUso:")
+    print("  python3 smart-chery-pick.py <commit_hash> [commit_hash2 ... commit_hashN] [opciones]")
+    print("  python3 smart-chery-pick.py --range-commits <start_commit> <end_commit> [opciones]")
+    print("  python3 smart-chery-pick.py --apply-saved [opciones]")
+    print("  python3 smart-chery-pick.py --help")
+    print("\nArgumentos:")
     print("  <commit_hash>          Uno o más hashes de commits para aplicar")
     print("  --range-commits        Especifica un rango de commits para aplicar")
     print("    start_commit         Commit inicial (más antiguo) del rango")
     print("    end_commit           Commit final (más reciente) del rango")
-    print("Opciones:")
+    print("\nOpciones:")
     print("  --remote REMOTE_NAME   Nombre del remote de Git (ej: origin, upstream, rem2)")
     print("  --skip-commit COMMITS  Lista de commits a omitir cuando se usa --range-commits")
     print("  --auto                 Modo automático (usa opciones por defecto sin preguntar)")
@@ -1507,13 +1822,24 @@ def show_help():
     print("  --dry-run              Simula el proceso sin aplicar cambios")
     print("  --apply-saved          Aplica los commits guardados previamente")
     print("  --config KEY=VALUE     Establece opciones de configuración")
+    print("  --no-stats             Desactiva el registro de estadísticas")
     print("  --help                 Muestra este mensaje de ayuda")
-    print("Ejemplos:")
-    print("  python3 smart_cherry_pick.py abc1234")
-    print("  python3 smart_cherry_pick.py abc1234 def5678 --remote origin")
-    print("  python3 smart_cherry_pick.py --range-commits abc1234 def5678 --remote rem2")
-    print("  python3 smart_cherry_pick.py --range-commits abc1234 def5678 --skip-commit ghi9012 jkl3456")
-    print("  python3 smart_cherry_pick.py --auto --range-commits abc1234 def5678")
+    print("\nConfiguración:")
+    print("  max_commits_display    Número máximo de commits a mostrar en listas")
+    print("  max_search_depth       Profundidad máxima para buscar dependencias")
+    print("  rename_detection_threshold Umbral para detección de archivos renombrados (0-100)")
+    print("  auto_add_dependencies  Agregar automáticamente dependencias encontradas (true/false)")
+    print("  show_progress_bar      Mostrar barra de progreso (true/false)")
+    print("  max_retries            Número máximo de reintentos para comandos fallidos")
+    print("  retry_delay            Retraso en segundos entre reintentos")
+    print("  record_stats           Registrar estadísticas en CSV (true/false)")
+    print("\nEjemplos:")
+    print("  python3 smart-chery-pick.py abc1234")
+    print("  python3 smart-chery-pick.py abc1234 def5678 --remote origin")
+    print("  python3 smart-chery-pick.py --range-commits abc1234 def5678 --remote rem2")
+    print("  python3 smart-chery-pick.py --range-commits abc1234 def5678 --skip-commit ghi9012 jkl3456")
+    print("  python3 smart-chery-pick.py --auto --range-commits abc1234 def5678")
+    print("  python3 smart-chery-pick.py --config max_search_depth=50 auto_add_dependencies=true")
 
 def validate_remote(remote):
     """Valida y actualiza la información de un remote Git."""
@@ -1570,6 +1896,7 @@ def main():
     parser.add_argument('--apply-saved', action='store_true', help='Aplica los commits guardados previamente')
     parser.add_argument('--config', nargs='+', metavar='KEY=VALUE', help='Establece opciones de configuración')
     parser.add_argument('--help', action='store_true', help='Muestra este mensaje de ayuda')
+    parser.add_argument('--no-stats', action='store_true', help='No registrar estadísticas')
 
     try:
         args = parser.parse_args()
@@ -1581,6 +1908,7 @@ def main():
         show_help()
         return
 
+    # Configuración de ejecución
     if args.auto:
         auto_mode = True
     if args.verbose:
@@ -1588,20 +1916,51 @@ def main():
     if args.dry_run:
         dry_run = True
         print(Fore.YELLOW + "Modo simulación activado. No se aplicarán cambios reales.")
-
+    
+    # Cargar y actualizar configuración
     load_config()
     if args.config:
         update_config_from_args(args.config)
-
+    
+    # Configuración de estadísticas
+    if args.no_stats:
+        config["record_stats"] = False
+    
+    # Inicialización de archivos
     if not os.path.exists(LOG_FILE):
         open(LOG_FILE, "w").close()
+    
+    # Inicializar estadísticas si están habilitadas
+    if config["record_stats"]:
+        init_stats_file()
 
     log_message("Iniciando Smart Cherry Pick", "INFO")
 
     if args.remote:
         remote_name = args.remote
         log_message(f"Usando remote '{remote_name}' para buscar commits y archivos.", "INFO")
-        validate_remote(remote_name)
+        # Validar si el remote existe, y si no, preguntar si desea crearlo
+        remotes = run("git remote").splitlines()
+        if remote_name not in remotes:
+            print(Fore.YELLOW + f"El remote '{remote_name}' no existe.")
+            if not auto_mode:
+                create_remote = input(Fore.CYAN + f"¿Deseas agregar el remote '{remote_name}'? (URL del repositorio o 'n' para cancelar): ").strip()
+                if create_remote.lower() != 'n' and create_remote:
+                    try:
+                        run(f"git remote add {remote_name} {create_remote}", capture_output=False)
+                        log_message(f"Remote '{remote_name}' agregado con URL {create_remote}", "SUCCESS")
+                        validate_remote(remote_name)
+                    except Exception as e:
+                        log_message(f"Error al agregar el remote: {str(e)}", "ERROR")
+                        sys.exit(1)
+                else:
+                    log_message(f"Operación cancelada. No se agregó el remote '{remote_name}'", "WARNING")
+                    sys.exit(1)
+            else:
+                log_message(f"Remote '{remote_name}' no existe y modo automático activado. Abortando.", "ERROR")
+                sys.exit(1)
+        else:
+            validate_remote(remote_name)
 
     author_map = load_author_map()
     applied_commits = load_history()
@@ -1653,31 +2012,44 @@ def main():
     final_commits = []
     analyzed_commits = set()
 
-    for commit in initial_commits:
-        if commit in applied_commits:
-            log_message(f"El commit {commit} ya fue aplicado anteriormente. Saltando.", "INFO")
-            continue
+    # Procesar cada commit
+    total_start_time = time.time()
+    try:
+        for commit in initial_commits:
+            if commit in applied_commits:
+                log_message(f"El commit {commit} ya fue aplicado anteriormente. Saltando.", "INFO")
+                continue
 
-        if commit in skipped_commits:
-            log_message(f"El commit {commit} está en la lista de commits a omitir. Saltando.", "INFO")
-            continue
+            if commit in skipped_commits:
+                log_message(f"El commit {commit} está en la lista de commits a omitir. Saltando.", "INFO")
+                continue
 
-        initial_commit = commit
-        stop_analysis = False
-        cherry_pick_queue = [commit]
+            initial_commit = commit
+            stop_analysis = False
+            cherry_pick_queue = [commit]
 
-        process_commit(commit, dep_cache)
+            process_commit(commit, dep_cache)
 
-    if final_commits and not all(c in applied_commits for c in final_commits):
-        ask_to_proceed()
+        if final_commits and not all(c in applied_commits for c in final_commits):
+            ask_to_proceed()
 
-    save_history(applied_commits)
-    save_dep_cache(dep_cache)
-    save_author_map(author_map)
+    except KeyboardInterrupt:
+        print(Fore.RED + "\nOperación interrumpida por el usuario.")
+        # Guardar el progreso actual
+        save_history(applied_commits)
+        save_dep_cache(dep_cache)
+        save_author_map(author_map)
+        print(Fore.YELLOW + "Se ha guardado el progreso. Puedes retomar más tarde con --apply-saved.")
+        sys.exit(1)
+    finally:
+        # Guardar estado final
+        save_history(applied_commits)
+        save_dep_cache(dep_cache)
+        save_author_map(author_map)
 
-    elapsed_time = int(time.time() - start_time)
-    log_message(f"Proceso completado en {elapsed_time} segundos.", "SUCCESS")
-    print(Fore.GREEN + f"\nProceso completado en {elapsed_time} segundos.")
+        elapsed_time = int(time.time() - start_time)
+        log_message(f"Proceso completado en {elapsed_time} segundos.", "SUCCESS")
+        print(Fore.GREEN + f"\nProceso completado en {elapsed_time} segundos.")
 
 if __name__ == "__main__":
     main()
