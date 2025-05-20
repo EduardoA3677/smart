@@ -1,0 +1,40 @@
+{
+ "name": "Python 3",
+ "image": "mcr.microsoft.com/devcontainers/python:1-3.12-bullseye",
+ "remoteUser": "vscode",
+ "features": {
+    "ghcr.io/devcontainers/features/sshd:1": {
+      "version": "latest"
+    },
+    "ghcr.io/devcontainers/features/github-cli:1": {},
+    "ghcr.io/devcontainers/features/git:1": {}
+  },
+ "customizations": {
+  "vscode": {
+   "settings": {
+        "terminal.integrated.defaultProfile.linux": "zsh",
+        "github.copilot.chat.codesearch.enabled": true,
+        "github.copilot.chat.agent.thinkingTool": true
+      },
+   "extensions": [
+    "gruntfuggly.todo-tree",
+    "ms-azuretools.vscode-docker",
+    "mhutchie.git-graph",
+    "ms-python.python",
+    "ms-python.vscode-pylance",
+    "ryanluker.vscode-coverage-gutters",
+    "meezilla.json",
+    "eamodio.gitlens",
+    "emmanuelbeziat.vscode-great-icons",
+    "dongido.sync-env",
+    "yzhang.markdown-all-in-one",
+    "github.vscode-github-actions",
+    "foxundermoon.shell-format",
+    "shardulm94.trailing-spaces",
+    "github.vscode-pull-request-github",
+    "github.copilot",
+    "github.copilot-chat"
+   ]
+  }
+ }
+}
