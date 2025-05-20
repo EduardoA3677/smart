@@ -1569,37 +1569,105 @@ def handle_missing_file(missing_file, adding_commit, current_commit):
         return False
 
 def ask_file_renames_from_errors(failed_files):
+    """
+    Permite al usuario especificar rutas correctas para archivos que fallaron durante un cherry-pick.
+    """
+    if not failed_files:
+        log_message("No hay archivos con problemas para renombrar.", "INFO")
+        return False
+        
+    # Para modo automático
+    if auto_mode:
+        log_message("Modo automático: buscando archivos similares para ruta automática", "INFO")
+        rename_count = 0
+        
+        for archivo in failed_files:
+            # Intentar buscar un archivo similar en el repositorio
+            similar_files = find_similar_files(archivo)
+            if similar_files and similar_files[0][1] > 70:  # Si hay un archivo similar con score > 70%
+                file_renames[archivo] = similar_files[0][0]
+                log_message(f"Mapeo automático: {archivo} -> {similar_files[0][0]} (similitud: {similar_files[0][1]}%)", "INFO")
+                rename_count += 1
+        
+        if rename_count == len(failed_files):
+            save_file_renames()  # Guardar los renombres
+            return True
+        elif rename_count > 0:
+            log_message(f"Se renombraron automáticamente {rename_count} de {len(failed_files)} archivos", "INFO")
+            # Intentamos con los que se encontraron, tal vez es suficiente
+            return True
+            
+    # Modo interactivo para usuario
     while True:
         print(Fore.RED + "\nCherry-pick fallido. Posibles errores por renombre de archivos:")
-        # Se muestran cada uno de los archivos conflictivos
+        
+        # Mostrar archivos con problemas
         for i, archivo in enumerate(failed_files, 1):
             ruta_actual = file_renames.get(archivo, archivo)
             print(Fore.YELLOW + f"{i}. {ruta_actual}")
-        print(Fore.YELLOW + "4. Continuar con las rutas modificadas")
         
-        opcion = input("Selecciona una opción: ").strip()
-        if opcion == "4":
-            # El usuario confirma que ya ha editado (o desea continuar con) todas las rutas
-            return True
+        # Opciones adicionales
+        terminar_opcion = len(failed_files) + 1
+        cancelar_opcion = len(failed_files) + 2
+        print(Fore.GREEN + f"{terminar_opcion}. Continuar con las rutas modificadas")
+        print(Fore.RED + f"{cancelar_opcion}. Cancelar y abortar el proceso")
+        
+        # Procesar la opción del usuario
+        opcion = input(Fore.CYAN + "Selecciona una opción (número): ").strip()
+        
+        # Verificar si el usuario quiere terminar
+        if opcion == str(terminar_opcion):
+            # Verificar que al menos un archivo haya sido renombrado
+            if any(archivo in file_renames for archivo in failed_files):
+                save_file_renames()  # Guardar los cambios
+                return True
+            else:
+                continuar = input(Fore.YELLOW + "No se han especificado renombres. ¿Continuar de todos modos? (s/n): ").lower()
+                if continuar.startswith('s'):
+                    return True
+                else:
+                    continue
+        
+        # Verificar si el usuario quiere cancelar
+        if opcion == str(cancelar_opcion):
+            return False
+            
+        # Procesar selección de archivo para renombrar
         try:
             idx = int(opcion)
-        except ValueError:
-            print(Fore.RED + "Opción inválida. Intenta de nuevo.")
-            continue
-        if 1 <= idx <= len(failed_files):
-            archivo = failed_files[idx - 1]
-            ruta_actual = file_renames.get(archivo, archivo)
-            nueva_ruta = input(f"Ingrese la ruta local correcta para '{ruta_actual}': ").strip()
-            if nueva_ruta:
-                file_renames[archivo] = nueva_ruta
-                log_message(f"Renombramiento editado: {archivo} -> {nueva_ruta}", "INFO")
+            if 1 <= idx <= len(failed_files):
+                archivo = failed_files[idx - 1]
+                ruta_actual = file_renames.get(archivo, archivo)
+                
+                # Mostrar archivos similares como sugerencia
+                similar_files = find_similar_files(archivo)
+                if similar_files:
+                    print(Fore.CYAN + "\nArchivos similares encontrados:")
+                    for i, (similar_path, score) in enumerate(similar_files[:3], 1):
+                        print(Fore.CYAN + f"  {i}. {similar_path} (similitud: {score}%)")
+                
+                # Solicitar nueva ruta
+                nueva_ruta = input(Fore.CYAN + f"Ingrese la ruta correcta para '{ruta_actual}' (vacío para mantener): ").strip()
+                
+                if nueva_ruta:
+                    file_renames[archivo] = nueva_ruta
+                    log_message(f"Renombramiento configurado: {archivo} -> {nueva_ruta}", "INFO")
+                else:
+                    print(Fore.YELLOW + "No se ingresó ninguna ruta. Se mantiene la ruta actual.")
             else:
-                print(Fore.RED + "No se ingresó ninguna ruta. Se mantiene la ruta actual.")
-        else:
-            print(Fore.RED + "Opción inválida. Intenta de nuevo.")
+                print(Fore.RED + "Opción inválida. Intenta de nuevo.")
+        except ValueError:
+            print(Fore.RED + "Por favor, ingresa un número válido.")
 
 
 def apply_patch_with_rename_handling(commit):
+    """
+    Aplica un cherry-pick manejando renombres de archivos especificados en file_renames.
+    Genera un parche a partir del commit y lo modifica antes de aplicarlo.
+    """
+    op_key = start_operation_timer(commit, "patch_rename_handling")
+    
+    # Preparar referencia del commit
     commit_ref = commit
     if remote_name:
         remote_ref = f"{remote_name}/{commit}"
@@ -1607,78 +1675,161 @@ def apply_patch_with_rename_handling(commit):
         if test_exists:
             commit_ref = remote_ref
 
-    print(Fore.GREEN + f"\nAplicando cherry-pick -n {commit}...")
+    print(Fore.GREEN + f"\nAplicando cherry-pick con manejo de renombres para {commit}...")
+    
+    # Generar parche a partir del commit
     patch = run(f"git format-patch -1 {commit_ref} --stdout")
     if not patch.strip():
-        log_message("El commit no tiene cambios. Saltando.", "WARNING")
-        return False
-
-    # Se reemplazan en el parche las rutas que ya se hayan corregido previamente
+        log_message("El commit no tiene cambios. Marcando como aplicado.", "WARNING")
+        return True  # No hay cambios, consideramos éxito
+    
+    # Verificar qué archivos se ven afectados
+    affected_files = []
+    for line in patch.splitlines():
+        if line.startswith("--- a/") or line.startswith("+++ b/"):
+            path = line[6:].strip()
+            if path and path != "/dev/null" and path not in affected_files:
+                affected_files.append(path)
+    
+    log_message(f"Commit afecta a {len(affected_files)} archivos", "INFO")
+    
+    # Buscar y aplicar renombres automáticamente si es necesario
+    for file_path in affected_files:
+        if file_path not in file_renames and not os.path.exists(file_path):
+            similar_files = find_similar_files(file_path)
+            if similar_files and similar_files[0][1] > 80:  # Alta similitud (80%)
+                file_renames[file_path] = similar_files[0][0]
+                log_message(f"Renombre automático: {file_path} -> {similar_files[0][0]}", "INFO")
+    
+    # Reemplazar rutas en el parche con los renombres definidos
+    modified_patch = patch
     for origen, destino in file_renames.items():
-        patch = patch.replace(origen, destino)
-
+        # Reemplazar en líneas de diff (--- a/ruta, +++ b/ruta)
+        modified_patch = modified_patch.replace(f"--- a/{origen}", f"--- a/{destino}")
+        modified_patch = modified_patch.replace(f"+++ b/{origen}", f"+++ b/{destino}")
+        # Reemplazar en headers de diff (diff --git a/ruta b/ruta)
+        modified_patch = modified_patch.replace(f"diff --git a/{origen} b/{origen}", 
+                                             f"diff --git a/{destino} b/{destino}")
+        # Reemplazar en otras líneas (como mensajes)
+        modified_patch = modified_patch.replace(f" {origen}", f" {destino}")
+    
+    # Escribir parche modificado a archivo temporal
     with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmpfile:
-        tmpfile.write(patch)
+        tmpfile.write(modified_patch)
         tmpfile_path = tmpfile.name
-
+    
+    # Intentar aplicar el parche modificado
     result = subprocess.run(f"git apply --index {tmpfile_path}", shell=True)
+    
     if result.returncode != 0:
-        # Se obtiene la salida que indica los archivos con error en la aplicación del parche
+        # Análisis de fallo
         failed_output = run(f"git apply --check {tmpfile_path} 2>&1")
+        log_message(f"Error al aplicar parche. Analizando problemas.", "WARNING")
+        
+        # Extraer archivos con problemas
         failed_files = []
         for line in failed_output.splitlines():
-            if "patch does not apply" in line or "patch failed" in line:
-                partes = line.split(":")
-                if len(partes) >= 2:
-                    archivo_error = partes[0].replace("error", "").strip()
-                    # Si vienen varias rutas separadas por ':' (por ejemplo, "ruta1:ruta2") se pueden separar:
-                    subarchivos = archivo_error.split(":")
-                    for sub in subarchivos:
-                        sub = sub.strip()
-                        if sub and sub not in failed_files:
-                            failed_files.append(sub)
+            if "patch does not apply" in line or "patch failed" in line or "error:" in line:
+                parts = line.split(":")
+                if len(parts) >= 2:
+                    error_file = parts[0].replace("error", "").strip()
+                    # Manejar rutas con ':'
+                    for sub_file in error_file.split(":"):
+                        sub_file = sub_file.strip()
+                        if sub_file and sub_file not in failed_files:
+                            failed_files.append(sub_file)
+        
+        # Limpiar archivo temporal
         os.unlink(tmpfile_path)
+        
         if failed_files:
-            print(Fore.RED + "\nSe detectaron los siguientes errores:")
+            print(Fore.RED + f"\nProblemas al aplicar parche en {len(failed_files)} archivos:")
             for f in failed_files:
-                print(Fore.CYAN + f" - {f}")
-            # Se llama a la función para que el usuario corrija manualmente TODOS los archivos conflictivos.
+                print(Fore.YELLOW + f" - {f}")
+            
+            # Solicitar al usuario correcciones adicionales
             if ask_file_renames_from_errors(failed_files):
-                # Regenera el parche incorporando las rutas corregidas
-                patch = run(f"git format-patch -1 {commit_ref} --stdout")
+                # Regenerar parche con las nuevas correcciones
+                log_message("Regenerando parche con nuevos renombres...", "INFO")
+                
+                # Recrear el parche con los nuevos renombres
+                new_patch = run(f"git format-patch -1 {commit_ref} --stdout")
                 for origen, destino in file_renames.items():
-                    patch = patch.replace(origen, destino)
+                    # Aplicar los mismos reemplazos que antes
+                    new_patch = new_patch.replace(f"--- a/{origen}", f"--- a/{destino}")
+                    new_patch = new_patch.replace(f"+++ b/{origen}", f"+++ b/{destino}")
+                    new_patch = new_patch.replace(f"diff --git a/{origen} b/{origen}", 
+                                               f"diff --git a/{destino} b/{destino}")
+                    new_patch = new_patch.replace(f" {origen}", f" {destino}")
+                
+                # Escribir nuevo parche y aplicarlo
                 with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmpfile2:
-                    tmpfile2.write(patch)
+                    tmpfile2.write(new_patch)
                     tmpfile_path2 = tmpfile2.name
-                result = subprocess.run(f"git apply --index {tmpfile_path2}", shell=True)
+                
+                # Intento final
+                print(Fore.GREEN + "Intentando aplicar parche con correcciones...")
+                result = subprocess.run(f"git apply --index --reject {tmpfile_path2}", shell=True)
                 os.unlink(tmpfile_path2)
+                
                 if result.returncode != 0:
-                    log_message("Error al aplicar el parche después de corregir las rutas.", "ERROR")
-                    return False
+                    # Verificar si se aplicó parcialmente (con rechazos)
+                    reject_files = run("find . -name '*.rej'", allow_fail=True).splitlines()
+                    if reject_files:
+                        print(Fore.YELLOW + f"Parche aplicado parcialmente. {len(reject_files)} archivos con rechazos.")
+                        
+                        # Preguntar si continuar con aplicación parcial
+                        if auto_mode or input(Fore.CYAN + "¿Continuar con aplicación parcial? (s/n): ").lower().startswith('s'):
+                            log_message("Continuando con aplicación parcial del parche", "WARNING")
+                        else:
+                            log_message("Aplicación parcial rechazada por el usuario", "ERROR")
+                            end_operation_timer(op_key, "failure", "rejected_partial")
+                            return False
+                    else:
+                        log_message("Error al aplicar el parche con las correcciones.", "ERROR")
+                        end_operation_timer(op_key, "failure", "patch_error")
+                        return False
             else:
-                log_message("No se pudieron resolver los conflictos de renombrado.", "ERROR")
+                log_message("Proceso de renombrado cancelado por el usuario.", "WARNING")
+                end_operation_timer(op_key, "cancelled", "user_cancelled")
                 return False
         else:
-            log_message("No se pudieron identificar archivos conflictivos.", "ERROR")
+            log_message("No se pudieron identificar archivos específicos con problemas.", "ERROR")
+            end_operation_timer(op_key, "failure", "unidentified_error")
             return False
     else:
+        # Limpieza
         os.unlink(tmpfile_path)
-
-    # Una vez aplicado el parche, se procede a crear el commit.
+        log_message("Parche aplicado correctamente con renombres", "SUCCESS")
+    
+    # Crear commit con los cambios
     result = subprocess.run("git diff --cached --quiet", shell=True)
-    if result.returncode != 0:
+    if result.returncode != 0:  # Hay cambios
+        # Obtener mensaje original
         message = run(f"git log -1 --pretty=format:%B {commit_ref}").strip()
         try:
+            # Crear commit usando el mensaje original
             with tempfile.NamedTemporaryFile(mode="w+", delete=False) as msg_file:
                 msg_file.write(message)
                 msg_file_path = msg_file.name
-            subprocess.run(f"git commit -F {msg_file_path}", shell=True)
+            
+            commit_result = subprocess.run(f"git commit -F {msg_file_path}", shell=True)
             os.unlink(msg_file_path)
+            
+            if commit_result.returncode != 0:
+                # Fallback con mensaje simple
+                log_message("Error al crear commit con mensaje original. Usando mensaje simple.", "WARNING")
+                subprocess.run(f"git commit -m \"Cherry-pick {commit} (con manejo de renombres)\"", shell=True)
         except Exception as e:
             log_message(f"Error al crear commit: {str(e)}", "ERROR")
             subprocess.run(f"git commit -m \"Cherry-pick {commit}\"", shell=True)
+    else:
+        log_message("No hay cambios para hacer commit después de aplicar el parche.", "WARNING")
+    
+    # Marcar como exitoso y guardar estadísticas
+    end_operation_timer(op_key, "success", "rename_handling")
     log_message(f"Commit {commit} aplicado exitosamente con manejo de renombres.", "SUCCESS")
+    save_file_renames()  # Guardar renombres para futuros commits
     return True
 
 
