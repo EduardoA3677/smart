@@ -63,7 +63,6 @@ clean_temp_files()
 atexit.register(clean_temp_files)
 
 def log_message(message, level="INFO"):
-    """Registra un mensaje en el archivo de log con timestamp."""
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with open(LOG_FILE, "a") as f:
         f.write(f"{timestamp} [{level}] {message}\n")
@@ -80,7 +79,6 @@ def log_message(message, level="INFO"):
         print(f"{color}[{level}] {message}")
 
 def load_config():
-    """Carga la configuración desde el archivo de configuración."""
     global config
     if os.path.exists(CONFIG_FILE):
         try:
@@ -91,93 +89,37 @@ def load_config():
             log_message(f"Error al cargar configuración: {str(e)}", "ERROR")
 
 def save_config():
-    """Guarda la configuración actual en el archivo de configuración."""
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
 def run(cmd, capture_output=True, input_text=None, retry=0, allow_fail=False):
-    """Ejecuta un comando de shell con reintento automático en caso de fallo."""
 
     if remote_name and f"{remote_name}/" in cmd:
-
-        if ("git log" in cmd and ".." in cmd):
-            if verbose_mode:
-                log_message(f"Detectado comando de rango git log con remote: {cmd}", "DEBUG")
-
+        if ("git log" in cmd and ".." in cmd) or ("git show" in cmd and ":" in cmd):
             try:
                 if verbose_mode:
                     log_message(f"Ejecutando: {cmd}", "DEBUG")
                 result = subprocess.run(cmd, shell=True, capture_output=capture_output, text=True, input=input_text)
-
-                if result.returncode != 0:
-
-                    local_cmd = cmd.replace(f"{remote_name}/", "")
-                    if verbose_mode:
-                        log_message(f"Comando remoto falló, intentando con referencias locales: {local_cmd}", "DEBUG")
-                    return run(local_cmd, capture_output, input_text, retry, allow_fail)
-
-                return result.stdout.strip() if capture_output else None
-            except Exception as e:
-
+                if result.returncode == 0:
+                    return result.stdout.strip() if capture_output else None
                 local_cmd = cmd.replace(f"{remote_name}/", "")
                 if verbose_mode:
-                    log_message(f"Error con comando remoto, intentando con referencias locales: {local_cmd}", "DEBUG")
+                    log_message(f"Fallo remoto, intento local: {local_cmd}", "DEBUG")
                 return run(local_cmd, capture_output, input_text, retry, allow_fail)
-
-        elif "git show" in cmd and ":" in cmd:
-            if verbose_mode:
-                log_message(f"Detectado comando git show con remote: {cmd}", "DEBUG")
-
-            try:
-                if verbose_mode:
-                    log_message(f"Ejecutando: {cmd}", "DEBUG")
-
-                result = subprocess.run(cmd, shell=True, capture_output=capture_output, text=True, input=input_text)
-
-                if result.returncode != 0:
-
-                    parts = cmd.split(":")
-                    if len(parts) >= 2:
-                        commit_ref = parts[0].split(" ")[-1]
-                        file_path = ":".join(parts[1:])
-
-                        if remote_name:
-                            fetch_cmd = f"git fetch {remote_name} {commit_ref}"
-                            if verbose_mode:
-                                log_message(f"Intentando hacer fetch del commit {commit_ref} desde {remote_name}", "DEBUG")
-                            subprocess.run(fetch_cmd, shell=True, capture_output=True, text=True)
-
-                        local_commit = commit_ref.replace(f"{remote_name}/", "")
-                        local_cmd = f"git show {local_commit}:{file_path}"
-                        if verbose_mode:
-                            log_message(f"Comando show remoto falló, intentando con referencia local: {local_cmd}", "DEBUG")
-
-                        return run(local_cmd, capture_output, input_text, 0, allow_fail)
-
-                return result.stdout.strip() if capture_output else None
-
-            except Exception as e:
-
-                if allow_fail:
-                    return ""
-                if verbose_mode:
-                    log_message(f"Error con comando git show: {str(e)}", "ERROR")
-                return ""
-
+            except Exception:
+                local_cmd = cmd.replace(f"{remote_name}/", "")
+                return run(local_cmd, capture_output, input_text, retry, allow_fail)
     try:
         if verbose_mode:
             log_message(f"Ejecutando: {cmd}", "DEBUG")
         result = subprocess.run(cmd, shell=True, capture_output=capture_output, text=True, input=input_text)
-
         if result.returncode != 0:
             if allow_fail:
-
                 return ""
             elif retry < config["max_retries"]:
                 log_message(f"Comando falló. Reintento {retry+1}/{config['max_retries']}: {cmd}", "WARNING")
                 time.sleep(config["retry_delay"])
                 return run(cmd, capture_output, input_text, retry + 1, allow_fail)
-
         return result.stdout.strip() if capture_output else None
     except Exception as e:
         if allow_fail:
@@ -190,7 +132,6 @@ def run(cmd, capture_output=True, input_text=None, retry=0, allow_fail=False):
         return ""
 
 def select_option(options, prompt="Selecciona una opción: "):
-    """Presenta opciones al usuario y devuelve la selección."""
     if auto_mode:
         log_message(f"Modo automático: seleccionando opción por defecto '{options[0]}'", "INFO")
         return options[0]
@@ -209,31 +150,26 @@ def select_option(options, prompt="Selecciona una opción: "):
         return options[0]
 
 def load_history():
-    """Carga el historial de commits ya aplicados."""
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r") as f:
             return set(json.load(f))
     return set()
 
 def save_history(commits):
-    """Guarda el historial de commits aplicados."""
     with open(HISTORY_FILE, "w") as f:
         json.dump(sorted(list(commits)), f, indent=2)
 
 def load_dep_cache():
-    """Carga la caché de dependencias de commits."""
     if os.path.exists(COMMIT_DEP_CACHE):
         with open(COMMIT_DEP_CACHE, "r") as f:
             return json.load(f)
     return {}
 
 def save_dep_cache(cache):
-    """Guarda la caché de dependencias de commits."""
     with open(COMMIT_DEP_CACHE, "w") as f:
         json.dump(cache, f, indent=2)
 
 def load_author_map():
-    """Carga el mapeo de autores a nombres de usuario."""
     if os.path.exists(AUTHOR_MAP_CACHE):
         try:
             with open(AUTHOR_MAP_CACHE, "r") as f:
@@ -243,24 +179,20 @@ def load_author_map():
     return {}
 
 def save_author_map(map_data):
-    """Guarda el mapeo de autores a nombres de usuario."""
     with open(AUTHOR_MAP_CACHE, "w") as f:
         json.dump(map_data, f, indent=2)
 
 def save_commits_list(commits):
-    """Guarda la lista de commits procesados en un archivo."""
     with open(COMMITS_LIST_FILE, "w") as f:
         json.dump(commits, f, indent=2)
 
 def load_commits_list():
-    """Carga la lista de commits desde un archivo."""
     if os.path.exists(COMMITS_LIST_FILE):
         with open(COMMITS_LIST_FILE, "r") as f:
             return json.load(f)
     return []
 
 def extract_username_from_email(email):
-    """Extrae el nombre de usuario de una dirección de correo electrónico."""
     match = re.match(r'^([^@]+)@github\.com$', email)
     if match:
         return match.group(1)
@@ -282,7 +214,6 @@ def extract_username_from_email(email):
     return None
 
 def infer_github_username(author_name, author_email):
-    """Infiere el nombre de usuario de GitHub basado en el nombre y correo del autor."""
     global author_map
     if author_name in author_map:
         return author_map[author_name]
@@ -315,50 +246,35 @@ def infer_github_username(author_name, author_email):
     return author_name
 
 def get_commit_files(commit):
-    """Obtiene la lista de archivos afectados por un commit."""
     ref = commit
     if remote_name:
         remote_ref = f"{remote_name}/{commit}"
         exists = run(f"git rev-parse --verify {remote_ref}^{{commit}} 2>/dev/null", allow_fail=True)
         if exists:
             ref = remote_ref
-
     try:
-
         files = run(f"git diff-tree --no-commit-id --name-status -r {ref}").splitlines()
         result = []
-
         for line in files:
             if not line:
                 continue
-
             parts = line.split()
-            status = parts[0]
-
-            if status.startswith('R'):
-
-                if len(parts) >= 3:
-                    result.append(parts[2])  
-            else:
-
-                if len(parts) >= 2:
-                    result.append(parts[1])
-
+            if parts[0].startswith('R') and len(parts) >= 3:
+                result.append(parts[2])
+            elif len(parts) >= 2:
+                result.append(parts[1])
         return result
     except Exception as e:
         log_message(f"Error al obtener archivos del commit {commit}: {str(e)}", "ERROR")
-
         return run(f"git show --pretty='' --name-only {ref}").splitlines()
 
 def get_last_commit_affecting_file(file_path):
-    """Obtiene el último commit que modificó un archivo."""
     cmd = f"git log -n 1 --pretty=format:'%H' -- {file_path}"
     if remote_name:
         cmd = f"git log -n 1 --pretty=format:'%H' {remote_name} -- {file_path}"
     return run(cmd).strip("'")
 
 def ask_to_search_file(file_path):
-    """Pregunta al usuario si desea buscar un archivo faltante."""
     global stop_analysis
 
     print(Fore.YELLOW + f"\nEl archivo '{file_path}' no existe en la rama actual.")
@@ -393,7 +309,6 @@ def ask_to_search_file(file_path):
         sys.exit(1)
 
 def search_file_in_remote(file_path):
-    """Busca un archivo en todas las ramas del remote especificado."""
     if not remote_name:
         return None
 
@@ -429,71 +344,50 @@ def search_file_in_remote(file_path):
     return None
 
 def find_commit_adding_file(file_path):
-    """Busca el commit que agregó un archivo, con métodos avanzados de búsqueda."""
     if remote_name:
-        log_message(f"Buscando en remote '{remote_name}' el archivo '{file_path}'", "INFO")
         run(f"git fetch {remote_name}")
-
         result = run(f"git log --diff-filter=A --format='%H' {remote_name} -- {file_path}")
         if result:
             commits = result.splitlines()
             if commits:
                 return commits[-1]
-
         result = run(f"git log --full-history --format='%H' {remote_name} -- {file_path} | tail -1")
         if result:
             return result
-
         remote_refs = run(f"git for-each-ref --format='%(refname:short)' refs/remotes/{remote_name}").splitlines()
         for ref in remote_refs:
-            try:
-                result = run(f"git log --diff-filter=A --format='%H' {ref} -- {file_path}")
-                if result:
-                    commits = result.splitlines()
-                    if commits:
-                        return commits[-1]
-            except:
-                pass
-
+            result = run(f"git log --diff-filter=A --format='%H' {ref} -- {file_path}")
+            if result:
+                commits = result.splitlines()
+                if commits:
+                    return commits[-1]
     result = run(f"git log --diff-filter=A --format='%H' -- {file_path}")
     if result:
         commits = result.splitlines()
         if commits:
             return commits[-1]
-
     result = run(f"git log --full-history --format='%H' -- {file_path} | tail -1")
     if result:
         return result
-
     basename = os.path.basename(file_path)
-    log_message(f"Buscando archivos con nombre similar a '{basename}' en todo el historial", "INFO")
-
     search_cmd = f"git rev-list --all"
     if remote_name:
         search_cmd += f" {remote_name}"
-
     result = run(f"{search_cmd} | xargs -I{{}} git grep -l '{basename}' {{}} | head -1")
     if result:
         file_commit = run(f"git log -n 1 --pretty=format:'%H' {result}")
         if file_commit:
             return file_commit
-
     similar_files = find_similar_files(file_path)
-    if similar_files:
-        log_message(f"Encontrados {len(similar_files)} archivos similares a '{file_path}'", "INFO")
-        for similar, score in similar_files:
-            log_message(f"Archivo similar: '{similar}' (similitud: {score}%)", "INFO")
-            result = run(f"git log --diff-filter=A --format='%H' -- {similar} | tail -1")
-            if result:
-                return result
-
+    for similar, score in similar_files:
+        result = run(f"git log --diff-filter=A --format='%H' -- {similar} | tail -1")
+        if result:
+            return result
     if remote_name:
         return search_file_in_remote(file_path)
-
     return None
 
 def find_similar_files(file_path):
-    """Encuentra archivos con nombres similares en el repositorio."""
     basename = os.path.basename(file_path)
     dirname = os.path.dirname(file_path)
 
@@ -517,7 +411,6 @@ def find_similar_files(file_path):
     return similar_files[:5]  
 
 def calculate_similarity(str1, str2):
-    """Calcula el porcentaje de similitud entre dos cadenas usando la distancia de Levenshtein."""
     if not str1 or not str2:
         return 0
 
@@ -544,54 +437,35 @@ def calculate_similarity(str1, str2):
     return round(similarity)
 
 def find_commit_history_chain(file_path, target_commit):
-    """Encuentra la cadena completa de commits que afectan a un archivo."""
     remote_ref = f"{remote_name}/" if remote_name else ""
-
     creation_commit = find_commit_adding_file(file_path)
     if not creation_commit:
-        log_message(f"No se pudo encontrar cuándo se agregó '{file_path}'", "WARNING")
         return []
-
-    log_message(f"Commit de creación encontrado: {creation_commit[:8]}", "SUCCESS")
-
     try:
         target_ref = target_commit
         creation_ref = creation_commit
-
         if remote_name:
             remote_target = f"{remote_name}/{target_commit}"
-            target_exists = run(f"git rev-parse --verify {remote_target}^{{commit}} 2>/dev/null", allow_fail=True)
-            if target_exists:
+            if run(f"git rev-parse --verify {remote_target}^{{commit}} 2>/dev/null", allow_fail=True):
                 target_ref = remote_target
-
             remote_creation = f"{remote_name}/{creation_commit}"
-            creation_exists = run(f"git rev-parse --verify {remote_creation}^{{commit}} 2>/dev/null", allow_fail=True)
-            if creation_exists:
+            if run(f"git rev-parse --verify {remote_creation}^{{commit}} 2>/dev/null", allow_fail=True):
                 creation_ref = remote_creation
-
         if target_commit:
-
             result = run(f"git log --format='%H' {creation_ref}~1..{target_ref} -- {file_path}", allow_fail=True)
             if result:
                 commits = result.splitlines()
                 if creation_commit not in commits:
                     commits = [creation_commit] + commits
                 return commits
-
-        log_message(f"Buscando todos los commits que afectan a '{file_path}'", "INFO")
         all_commits = run(f"git log --format='%H' --follow {remote_ref} -- {file_path}", allow_fail=True).splitlines()
-
         if not all_commits:
             return [creation_commit]
-
         return all_commits
-    except Exception as e:
-        log_message(f"Error buscando historia de commits: {str(e)}", "ERROR")
-
+    except Exception:
         return [creation_commit]
 
 def find_file_history(file_path):
-    """Obtiene la historia completa de un archivo con detalles."""
     cmd = f"git log --name-status --follow --format='%H %cr: %s' -- {file_path}"
     if remote_name:
         cmd = f"git log --name-status --follow --format='%H %cr: %s' {remote_name} -- {file_path}"
@@ -599,7 +473,6 @@ def find_file_history(file_path):
     return run(cmd)
 
 def get_blame_and_grep_dependencies(commit, file, dep_cache=None):
-    """Analiza un commit para encontrar dependencias basadas en el código."""
     cache_key = f"{commit}:{file}"
     if dep_cache is not None and cache_key in dep_cache:
         return dep_cache[cache_key]
@@ -672,7 +545,6 @@ def get_blame_and_grep_dependencies(commit, file, dep_cache=None):
     return suspects
 
 def extract_includes(file_content):
-    """Extrae paths de archivos incluidos/importados en el código fuente."""
     includes = []
 
     patterns = [
@@ -704,7 +576,6 @@ def extract_includes(file_content):
     return includes
 
 def get_commit_context(commit):
-    """Obtiene información detallada de un commit en formato legible."""
     ref = commit
     commit_found = False
 
@@ -742,21 +613,18 @@ def get_commit_context(commit):
     return f"{commit_hash} ({commit_date}) - {commit_author} - {commit_subject}"
 
 def add_commit_once(commit):
-    """Agrega un commit a las listas de seguimiento sin duplicar."""
     if commit not in final_commits:
         final_commits.append(commit)
     if commit not in cherry_pick_queue:
         cherry_pick_queue.append(commit)
 
 def count_unique_pending_commits():
-    """Cuenta el número de commits únicos pendientes de aplicar."""
     unique_commits = set(final_commits + cherry_pick_queue)
     if initial_commit and initial_commit not in unique_commits:
         unique_commits.add(initial_commit)
     return len(unique_commits)
 
 def show_progress(current, total, message="Procesando"):
-    """Muestra una barra de progreso en la consola."""
     if not config["show_progress_bar"] or dry_run:
         return
 
@@ -771,7 +639,6 @@ def show_progress(current, total, message="Procesando"):
         print()
 
 def analyze_commit(commit, dep_cache):
-    """Analiza un commit para detectar dependencias y problemas potenciales."""
     global stop_analysis, processed_missing_files, created_files
 
     if stop_analysis:
@@ -792,189 +659,114 @@ def analyze_commit(commit, dep_cache):
 
     for idx, file in enumerate(files):
         show_progress(idx + 1, total_files, f"Analizando archivos de {commit[:8]}")
-
         actual_file = file_renames.get(file, file)
-
         if actual_file in created_files:
             continue
-
         file_exists = run(f"git ls-files --error-unmatch {actual_file} 2>/dev/null || echo 'NOT_EXISTS'")
         if file_exists == "NOT_EXISTS":
-
             file_commit_key = f"{file}:{commit}"
             if file_commit_key in processed_missing_files:
-                log_message(f"Archivo '{actual_file}' ya fue procesado anteriormente, omitiendo análisis repetido", "INFO")
                 continue
-
             processed_missing_files.add(file_commit_key)
-
             if not ask_to_search_file(actual_file):
-                log_message(f"Ignorando archivo faltante: {actual_file}", "WARNING")
                 continue
-
-            log_message(f"Buscando commits relacionados con '{actual_file}'", "INFO")
             adding_commit = find_commit_adding_file(file)
-
             if adding_commit:
-                context = get_commit_context(adding_commit)
-                print(Fore.MAGENTA + f"El archivo fue agregado originalmente en:\n  {context}")
-
                 commit_chain = find_commit_history_chain(file, commit)
-
                 if commit_chain and len(commit_chain) > 1:
-                    print(Fore.MAGENTA + f"Se encontraron {len(commit_chain)} commits que modifican este archivo:")
-
-                    max_display = min(config["max_commits_display"], len(commit_chain))
-                    for i, c in enumerate(commit_chain[:max_display], 1):
-                        c_context = get_commit_context(c)
-                        print(Fore.CYAN + f"  {i}. {c_context}")
-
-                    if len(commit_chain) > max_display:
-                        print(Fore.CYAN + f"     ... y {len(commit_chain)-max_display} más.")
-
-                    total_pending = count_unique_pending_commits()
-                    options = [
+                    option = select_option([
                         f"Agregar toda la cadena de {len(commit_chain)} commits relacionados con este archivo",
                         f"Agregar solo el commit que creó el archivo ({adding_commit[:8]})",
-                        f"Continuar con el cherry-pick ({total_pending})"
-                    ]
-                    option = select_option(options)
-
+                        f"Continuar con el cherry-pick ({count_unique_pending_commits()})"
+                    ])
                     if option.startswith("Agregar toda"):
                         for c in commit_chain:
                             add_commit_once(c)
-                            print(Fore.BLUE + f"Se agregó {c} a la lista de commits a aplicar.")
-
                         created_files.add(actual_file)
-
                         if stop_analysis:
                             return
                     elif option.startswith("Agregar solo"):
                         add_commit_once(adding_commit)
-                        print(Fore.BLUE + f"Se agregó {adding_commit} a la lista de commits a aplicar.")
-
                         created_files.add(actual_file)
-
                         if stop_analysis:
                             return
                     else:
                         stop_analysis = True
                         return
                 else:
-
-                    total_pending = count_unique_pending_commits()
-                    options = [
+                    option = select_option([
                         f"Agregar commit que creó el archivo {adding_commit[:8]}",
-                        f"Continuar con el cherry-pick ({total_pending})"
-                    ]
-                    option = select_option(options)
-
+                        f"Continuar con el cherry-pick ({count_unique_pending_commits()})"
+                    ])
                     if option.startswith("Agregar"):
                         add_commit_once(adding_commit)
-                        print(Fore.BLUE + f"Se agregó {adding_commit} a la lista de commits a aplicar.")
-
                         created_files.add(actual_file)
-
                         if stop_analysis:
                             return
                     elif option.startswith("Continuar"):
                         stop_analysis = True
                         return
             else:
-
-                print(Fore.RED + f"No se pudo encontrar ningún commit que haya creado '{actual_file}'.")
-                total_pending = count_unique_pending_commits()
-                options = [
+                option = select_option([
                     f"Especificar un archivo local equivalente",
-                    f"Continuar con el cherry-pick ({total_pending})",
+                    f"Continuar con el cherry-pick ({count_unique_pending_commits()})",
                     f"Cancelar análisis"
-                ]
-                option = select_option(options)
-
+                ])
                 if option.startswith("Especificar"):
                     local_name = input(f"Archivo local para '{actual_file}': ").strip()
                     file_renames[actual_file] = local_name
-
                     save_file_renames()
                 elif option.startswith("Cancelar"):
                     stop_analysis = True
                     return
-
         last_commit = get_last_commit_affecting_file(actual_file)
         if last_commit and last_commit != commit and last_commit not in analyzed_commits and last_commit not in applied_commits:
-            context = get_commit_context(last_commit)
-            print(Fore.MAGENTA + f"\n'{file}' fue modificado antes en:\n  {context}")
-
-            total_pending = count_unique_pending_commits()
-            options = [
+            option = select_option([
                 f"Agregar commit faltante a la lista de commits a aplicar {last_commit}",
-                f"Continuar con el cherry-pick ({total_pending})"
-            ]
-            option = select_option(options)
-
+                f"Continuar con el cherry-pick ({count_unique_pending_commits()})"
+            ])
             if option.startswith("Agregar"):
                 add_commit_once(last_commit)
-                print(Fore.BLUE + f"Se agregó {last_commit} a la lista de commits a aplicar.")
                 analyze_commit(last_commit, dep_cache)
                 if stop_analysis:
                     return
             elif option.startswith("Continuar"):
                 stop_analysis = True
                 return
-
         if stop_analysis:
             return
-
         dependencies = get_blame_and_grep_dependencies(commit, actual_file, dep_cache)
-
-        relevant_deps = [dep for dep in dependencies 
-                        if dep not in analyzed_commits 
-                        and dep not in applied_commits
-                        and dep != commit]
-
+        relevant_deps = [dep for dep in dependencies if dep not in analyzed_commits and dep not in applied_commits and dep != commit]
         for dep_commit in relevant_deps:
-            context = get_commit_context(dep_commit)
-            print(Fore.MAGENTA + f"\nDependencia detectada en {actual_file}:\n  {context}")
-
             if config["auto_add_dependencies"]:
                 add_commit_once(dep_commit)
-                print(Fore.BLUE + f"Se agregó automáticamente {dep_commit} a la lista de commits.")
                 continue
-
-            total_pending = count_unique_pending_commits()
-            options = [
+            choice = select_option([
                 f"Agregar commit faltante a la lista de commits a aplicar {dep_commit}",
-                f"Continuar con el cherry-pick ({total_pending})"
-            ]
-            choice = select_option(options)
-
+                f"Continuar con el cherry-pick ({count_unique_pending_commits()})"
+            ])
             if choice.startswith("Agregar"):
                 add_commit_once(dep_commit)
-                print(Fore.BLUE + f"Se agregó {dep_commit} a la lista de commits a aplicar.")
                 analyze_commit(dep_commit, dep_cache)
                 if stop_analysis:
                     return
             elif choice.startswith("Continuar"):
                 stop_analysis = True
                 return
-
             if stop_analysis:
                 return
 
 def save_file_renames():
-    """Guarda el mapeo de archivos renombrados para futuros usos."""
     with open(".smart_cherry_pick_renames.json", "w") as f:
         json.dump(file_renames, f, indent=2)
 
 def load_file_renames():
-    """Carga el mapeo de archivos renombrados de usos anteriores."""
     if os.path.exists(".smart_cherry_pick_renames.json"):
         with open(".smart_cherry_pick_renames.json", "r") as f:
             return json.load(f)
     return {}
 
 def process_commit(commit, dep_cache):
-    """Procesa un commit, preguntando primero si se debe analizar, aplicar directamente o editar antes de aplicarlo."""
     print(Fore.GREEN + f"\nProcesando commit: {get_commit_context(commit)}")
 
     if auto_mode:
@@ -1019,13 +811,6 @@ def process_commit(commit, dep_cache):
         edit_commit_before_applying(commit)
 
 def edit_commit_before_applying(commit):
-    """
-    Permite al usuario editar manualmente el contenido y el mensaje del commit antes de aplicarlo.
-    Se realiza un cherry-pick en modo no-commit (-n) para que los cambios se apliquen y se
-    registren en el índice. Luego se abre el editor configurado para que el usuario modifique
-    los archivos modificados y, a continuación, se edita el mensaje original del commit.
-    Finalmente se agregan los cambios y se crea el commit.
-    """
     commit_ref = commit
     if remote_name:
         remote_ref = f"{remote_name}/{commit}"
@@ -1073,7 +858,6 @@ def edit_commit_before_applying(commit):
     print(Fore.GREEN + f"Commit {commit} editado y aplicado correctamente.")
 
 def ask_to_proceed():
-    """Pregunta al usuario si desea proceder con los cherry-picks."""
 
     for commit in initial_commits:
         if commit not in final_commits:
@@ -1115,7 +899,6 @@ def ask_to_proceed():
             break
 
 def apply_commits_in_order():
-    """Aplica los cherry-picks en el orden correcto."""
 
     for commit in initial_commits:
         if commit not in final_commits and commit not in skipped_commits:
@@ -1185,7 +968,6 @@ def apply_commits_in_order():
     save_history(applied_commits)
 
 def parse_not_existing_files(error_output):
-    """Extrae nombres de archivos que no existen en el índice de la salida de error."""
     not_exist_files = []
     pattern = r"error: ([^:]+): does not exist in index"
     matches = re.findall(pattern, error_output)
@@ -1196,7 +978,6 @@ def parse_not_existing_files(error_output):
     return not_exist_files
 
 def handle_cherry_pick_error(commit):
-    """Maneja errores durante el proceso de cherry-pick."""
     log_message(f"Error al aplicar el commit {commit}. Analizando conflictos...", "ERROR")
 
     error_output = run("git status 2>&1")
@@ -1281,7 +1062,6 @@ def get_current_branch():
     ).stdout.strip()
 
 def get_file_content_at_commit(file_path, commit, branch_name):
-    """Obtiene el contenido de un archivo en un commit específico."""
 
     content = run(f"git show {commit}:{file_path}", allow_fail=True)
     branch_name = get_current_branch()
@@ -1305,7 +1085,6 @@ def get_file_content_at_commit(file_path, commit, branch_name):
     return None
 
 def handle_missing_file(missing_file, adding_commit, current_commit):
-    """Maneja archivos faltantes ofreciendo opciones al usuario."""
     global created_files
 
     commit_chain = find_commit_history_chain(missing_file, current_commit)
@@ -1400,12 +1179,6 @@ def handle_missing_file(missing_file, adding_commit, current_commit):
         return False
 
 def ask_file_renames_from_errors(failed_files):
-    """
-    Permite editar manualmente las rutas de TODOS los archivos conflictivos.
-    Se muestra un menú en el que se listan individualmente los archivos conflictivos (mostrando, de ser el caso,
-    la ruta corregida previamente) y se ofrece una opción adicional (opción 4) para continuar con las rutas que se han
-    modificado. La función retorna True cuando se selecciona la opción de continuar.
-    """
     while True:
         print(Fore.RED + "\nCherry-pick fallido. Posibles errores por renombre de archivos:")
         # Se muestran cada uno de los archivos conflictivos
@@ -1437,14 +1210,6 @@ def ask_file_renames_from_errors(failed_files):
 
 
 def apply_patch_with_rename_handling(commit):
-    """
-    Genera el parche correspondiente al commit y lo aplica.
-    Si al aplicarlo se presentan errores en los archivos por renombrado,
-    se recopila la lista completa de archivos conflictivos y se llama a
-    ask_file_renames_from_errors para que el usuario edite la ruta de TODOS ellos.
-    Una vez que el usuario selecciona la opción "Continuar con las rutas modificadas",
-    se regenera el parche incorporando todas las correcciones registradas y se reintenta la aplicación.
-    """
     commit_ref = commit
     if remote_name:
         remote_ref = f"{remote_name}/{commit}"
@@ -1527,7 +1292,6 @@ def apply_patch_with_rename_handling(commit):
     return True
 
 def handle_cherry_pick_error(commit):
-    """Maneja errores durante el proceso de cherry-pick."""
     log_message(f"Error al aplicar el commit {commit}. Analizando conflictos...", "ERROR")
 
     error_output = run("git status 2>&1")
@@ -1618,7 +1382,6 @@ def get_preferred_editor():
     return os.environ.get("EDITOR", "vi")
 
 def resume_cherry_pick(conflicted_files):
-    log_message("Resolviendo conflictos del cherry-pick...", "INFO")
 
     if not conflicted_files:
         conflicted_files = run("git diff --name-only --diff-filter=U").splitlines()
@@ -1726,38 +1489,31 @@ def get_commit_range(start_commit, end_commit):
     return commits
 
 def show_help():
-    help_text = f"""
-{Fore.GREEN}Smart Cherry Pick - Herramienta para aplicar commits de manera inteligente
-
-{Fore.CYAN}Uso:
-  python3 smart_cherry_pick.py <commit_hash> [commit_hash2 ... commit_hashN] [opciones]
-  python3 smart_cherry_pick.py --range-commits <start_commit> <end_commit> [opciones]
-  python3 smart_cherry_pick.py --help
-
-{Fore.CYAN}Argumentos:
-  <commit_hash>          Uno o más hashes de commits para aplicar
-  --range-commits        Especifica un rango de commits para aplicar
-    start_commit         Commit inicial (más antiguo) del rango
-    end_commit           Commit final (más reciente) del rango
-
-{Fore.CYAN}Opciones:
-  --remote REMOTE_NAME   Nombre del remote de Git (ej: origin, upstream, rem2)
-  --skip-commit COMMITS  Lista de commits a omitir cuando se usa --range-commits
-  --auto                 Modo automático (usa opciones por defecto sin preguntar)
-  --verbose              Modo verboso (muestra más información)
-  --dry-run              Simula el proceso sin aplicar cambios
-  --apply-saved          Aplica los commits guardados previamente
-  --config KEY=VALUE     Establece opciones de configuración
-  --help                 Muestra este mensaje de ayuda
-
-{Fore.CYAN}Ejemplos:
-  python3 smart_cherry_pick.py abc1234
-  python3 smart_cherry_pick.py abc1234 def5678 --remote origin
-  python3 smart_cherry_pick.py --range-commits abc1234 def5678 --remote rem2
-  python3 smart_cherry_pick.py --range-commits abc1234 def5678 --skip-commit ghi9012 jkl3456
-  python3 smart_cherry_pick.py --auto --range-commits abc1234 def5678
-    """
-    print(help_text)
+    print("Smart Cherry Pick - Herramienta para aplicar commits de manera inteligente")
+    print("Uso:")
+    print("  python3 smart_cherry_pick.py <commit_hash> [commit_hash2 ... commit_hashN] [opciones]")
+    print("  python3 smart_cherry_pick.py --range-commits <start_commit> <end_commit> [opciones]")
+    print("  python3 smart_cherry_pick.py --help")
+    print("Argumentos:")
+    print("  <commit_hash>          Uno o más hashes de commits para aplicar")
+    print("  --range-commits        Especifica un rango de commits para aplicar")
+    print("    start_commit         Commit inicial (más antiguo) del rango")
+    print("    end_commit           Commit final (más reciente) del rango")
+    print("Opciones:")
+    print("  --remote REMOTE_NAME   Nombre del remote de Git (ej: origin, upstream, rem2)")
+    print("  --skip-commit COMMITS  Lista de commits a omitir cuando se usa --range-commits")
+    print("  --auto                 Modo automático (usa opciones por defecto sin preguntar)")
+    print("  --verbose              Modo verboso (muestra más información)")
+    print("  --dry-run              Simula el proceso sin aplicar cambios")
+    print("  --apply-saved          Aplica los commits guardados previamente")
+    print("  --config KEY=VALUE     Establece opciones de configuración")
+    print("  --help                 Muestra este mensaje de ayuda")
+    print("Ejemplos:")
+    print("  python3 smart_cherry_pick.py abc1234")
+    print("  python3 smart_cherry_pick.py abc1234 def5678 --remote origin")
+    print("  python3 smart_cherry_pick.py --range-commits abc1234 def5678 --remote rem2")
+    print("  python3 smart_cherry_pick.py --range-commits abc1234 def5678 --skip-commit ghi9012 jkl3456")
+    print("  python3 smart_cherry_pick.py --auto --range-commits abc1234 def5678")
 
 def validate_remote(remote):
     """Valida y actualiza la información de un remote Git."""
