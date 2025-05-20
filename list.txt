@@ -1,0 +1,17 @@
+Extensiones instaladas en Codespaces: didactic fiesta:
+atommaterial.a-file-icon-vscode
+christian-kohler.path-intellisense
+eamodio.gitlens
+github.codespaces
+github.copilot
+github.copilot-chat
+github.github-vscode-theme
+github.vscode-github-actions
+github.vscode-pull-request-github
+ms-ceintl.vscode-language-pack-es
+ms-python.debugpy
+ms-python.python
+ms-python.vscode-pylance
+ms-vscode.vscode-websearchforcopilot
+pkief.material-icon-theme
+tobiasalthoff.atom-material-theme
