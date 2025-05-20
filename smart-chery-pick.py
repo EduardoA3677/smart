@@ -1749,8 +1749,8 @@ def ask_file_renames_from_errors(failed_files):
 def apply_patch_with_rename_handling(commit):
     """
     Aplica un cherry-pick manejando renombres de archivos especificados en file_renames.
-    Genera un parche a partir del commit y lo modifica antes de aplicarlo.
-    Maneja especialmente los conflictos tipo 'modify/delete'.
+    Si hay conflictos, los mantiene en el archivo con los marcadores estándar de Git
+    para permitir una edición manual posterior.
     """
     op_key = start_operation_timer(commit, "patch_rename_handling")
     
@@ -1764,236 +1764,260 @@ def apply_patch_with_rename_handling(commit):
 
     print(Fore.GREEN + f"\nAplicando cherry-pick con manejo de renombres para {commit}...")
     
-    # Obtener el mensaje del commit original antes de cualquier operación
-    commit_message = run(f"git log -1 --pretty=format:%B {commit_ref}").strip()
-    if not commit_message:
-        log_message(f"No se pudo obtener el mensaje del commit original, se usará un mensaje genérico", "WARNING")
-        commit_message = f"Cherry-pick {commit}"
+    # Primero, intentar aplicar el cherry-pick directamente pero preservando los conflictos
+    message = run(f"git log -1 --pretty=format:%B {commit_ref}").strip()
     
-    # Primero intentamos obtener información sobre los archivos afectados
-    affected_files_output = run(f"git show --name-status {commit_ref}")
+    # Aplicar los renombres a los archivos primero
+    for origen, destino in file_renames.items():
+        # Verificar si el archivo destino ya existe
+        if os.path.exists(destino) and not os.path.exists(origen):
+            log_message(f"Creando enlace simbólico para renombre: {origen} -> {destino}", "INFO")
+            
+            # Crear directorios si no existen
+            os.makedirs(os.path.dirname(origen), exist_ok=True)
+            
+            # En sistemas Unix, podemos crear un enlace simbólico
+            try:
+                if os.name == 'posix':
+                    # Crear un enlace simbólico
+                    run(f"ln -sf {destino} {origen}", allow_fail=True)
+                else:
+                    # En otros sistemas, copiar el archivo
+                    import shutil
+                    shutil.copy2(destino, origen)
+            except Exception as e:
+                log_message(f"Error al crear enlace para renombre: {str(e)}", "ERROR")
     
-    # Generar parche a partir del commit
-    patch = run(f"git format-patch -1 {commit_ref} --stdout")
-    if not patch.strip():
-        log_message("El commit no tiene cambios. Marcando como aplicado.", "WARNING")
-        # Crear un commit vacío con el mensaje original
+    # Intentar aplicar el cherry-pick directamente, sin hacer commit
+    cherry_result = run(f"git cherry-pick --no-commit {commit_ref} 2>&1", allow_fail=True)
+    cherry_success = "error: could not apply" not in cherry_result and "CONFLICT" not in cherry_result
+    
+    if cherry_success:
+        # El cherry-pick se aplicó sin conflictos, crear commit con el mensaje original
         try:
             with tempfile.NamedTemporaryFile(mode="w+", delete=False) as msg_file:
-                msg_file.write(commit_message)
-                msg_path = msg_file.name
+                msg_file.write(message)
+                msg_file_path = msg_file.name
             
-            run(f"git commit --allow-empty -F {msg_path}")
-            os.unlink(msg_path)
-            log_message(f"Commit vacío creado con mensaje original", "SUCCESS")
+            commit_result = subprocess.run(f"git commit -F {msg_file_path}", shell=True)
+            os.unlink(msg_file_path)
+            
+            log_message("Cherry-pick aplicado correctamente", "SUCCESS")
+            end_operation_timer(op_key, "success", "direct_cherry_pick")
+            applied_commits.add(commit)  # Marcar como aplicado
+            return True
+            
         except Exception as e:
-            log_message(f"Error al crear commit vacío: {str(e)}", "ERROR")
+            log_message(f"Error al crear commit: {str(e)}", "ERROR")
+            subprocess.run(f"git commit -m \"Cherry-pick {commit}\"", shell=True)
+            applied_commits.add(commit)  # Marcar como aplicado
+            return True
+    
+    # Si llegamos aquí, el cherry-pick falló con conflictos
+    
+    # Verificar qué archivos tienen conflictos
+    conflicted_files = run("git diff --name-only --diff-filter=U").splitlines()
+    
+    # Comprobar si hay conflictos de tipo modify/delete
+    git_status = run("git status -s", allow_fail=True)
+    modify_delete_files = []
+    
+    for line in git_status.splitlines():
+        if "DU" in line or "UD" in line or "AA" in line or "UU" in line:
+            parts = line.split()
+            if len(parts) >= 2:
+                file_path = " ".join(parts[1:])
+                if file_path not in conflicted_files:
+                    conflicted_files.append(file_path)
+    
+    # Mostrar información detallada del conflicto al estilo de git
+    if conflicted_files:
+        print(Fore.RED + f"error: could not apply {commit[:10]}... {message.splitlines()[0]}")
+        print(Fore.YELLOW + "hint: After resolving the conflicts, mark them with")
+        print(Fore.YELLOW + "hint: \"git add/rm <pathspec>\", then run")
+        print(Fore.YELLOW + "hint: \"git cherry-pick --continue\".")
+        print(Fore.YELLOW + "hint: You can instead skip this commit with \"git cherry-pick --skip\".")
+        print(Fore.YELLOW + "hint: To abort and get back to the state before \"git cherry-pick\",")
+        print(Fore.YELLOW + "hint: run \"git cherry-pick --abort\".")
         
-        end_operation_timer(op_key, "success", "empty_commit")
-        return True
-    
-    # Verificar qué archivos se ven afectados
-    affected_files = []
-    detected_conflicts = []
-    
-    for line in patch.splitlines():
-        if line.startswith("--- a/") or line.startswith("+++ b/"):
-            path = line[6:].strip()
-            if path and path != "/dev/null" and path not in affected_files:
-                affected_files.append(path)
-                
-                # Detectar posibles conflictos modify/delete
-                if not os.path.exists(path) and "/dev/null" not in line:
-                    detected_conflicts.append(path)
-    
-    log_message(f"Commit afecta a {len(affected_files)} archivos", "INFO")
-    if detected_conflicts:
-        log_message(f"Detectados {len(detected_conflicts)} posibles conflictos modify/delete", "WARNING")
-    
-    # Buscar y aplicar renombres automáticamente si es necesario
-    for file_path in affected_files:
-        if file_path not in file_renames and not os.path.exists(file_path):
-            similar_files = find_similar_files(file_path)
-            if similar_files and similar_files[0][1] > 80:  # Alta similitud (80%)
-                file_renames[file_path] = similar_files[0][0]
-                log_message(f"Renombre automático: {file_path} -> {similar_files[0][0]}", "INFO")
-    
-    # Reemplazar rutas en el parche con los renombres definidos
-    modified_patch = patch
-    for origen, destino in file_renames.items():
-        if destino == "/dev/null":
-            # Si el destino es /dev/null, la intención es eliminar el archivo
-            continue
+        print(Fore.RED + f"\nArchivos con conflictos detectados ({len(conflicted_files)}):")
+        for file in conflicted_files:
+            # Verificar si es un conflicto modify/delete
+            is_modify_delete = False
+            for line in git_status.splitlines():
+                if file in line and ("DU" in line or "UD" in line):
+                    is_modify_delete = True
+                    modify_delete_files.append(file)
+                    break
             
-        # Reemplazar en líneas de diff (--- a/ruta, +++ b/ruta)
-        modified_patch = modified_patch.replace(f"--- a/{origen}", f"--- a/{destino}")
-        modified_patch = modified_patch.replace(f"+++ b/{origen}", f"+++ b/{destino}")
-        # Reemplazar en headers de diff (diff --git a/ruta b/ruta)
-        modified_patch = modified_patch.replace(f"diff --git a/{origen} b/{origen}", 
-                                             f"diff --git a/{destino} b/{destino}")
-        # Reemplazar en otras líneas (como mensajes)
-        modified_patch = modified_patch.replace(f" {origen}", f" {destino}")
-    
-    # Escribir parche modificado a archivo temporal
-    tmp_path = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmpfile:
-            tmpfile.write(modified_patch)
-            tmp_path = tmpfile.name
+            conflict_type = "(modify/delete)" if is_modify_delete else ""
+            print(Fore.RED + f" - {file} {conflict_type}")
         
-        # Intentar aplicar el parche modificado
-        result = subprocess.run(f"git apply --index {tmp_path}", shell=True)
+        # Guardar mensaje de commit para usar más tarde
+        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as msg_file:
+            msg_file.write(message)
+            msg_path = msg_file.name
         
-        if result.returncode != 0:
-            # Análisis de fallo
-            failed_output = run(f"git apply --check {tmp_path} 2>&1", allow_fail=True)
-            log_message(f"Error al aplicar parche. Analizando problemas.", "WARNING")
-            
-            # Extraer archivos con problemas
-            failed_files = []
-            for line in failed_output.splitlines():
-                if "patch does not apply" in line or "patch failed" in line or "error:" in line:
-                    parts = line.split(":")
-                    if len(parts) >= 2:
-                        error_file = parts[0].replace("error", "").strip()
-                        # Manejar rutas con ':'
-                        for sub_file in error_file.split(":"):
-                            sub_file = sub_file.strip()
-                            if sub_file and sub_file not in failed_files:
-                                failed_files.append(sub_file)
-            
-            if failed_files:
-                print(Fore.RED + f"\nProblemas al aplicar parche en {len(failed_files)} archivos:")
-                for f in failed_files:
-                    print(Fore.YELLOW + f" - {f}")
-                
-                # Solicitar al usuario correcciones adicionales
-                if ask_file_renames_from_errors(failed_files):
-                    # Regenerar parche con las nuevas correcciones
-                    log_message("Regenerando parche con nuevos renombres...", "INFO")
-                    
-                    # Recrear el parche con los nuevos renombres
-                    new_patch = run(f"git format-patch -1 {commit_ref} --stdout")
-                    for origen, destino in file_renames.items():
-                        if destino == "/dev/null":
-                            continue
-                        # Aplicar los mismos reemplazos que antes
-                        new_patch = new_patch.replace(f"--- a/{origen}", f"--- a/{destino}")
-                        new_patch = new_patch.replace(f"+++ b/{origen}", f"+++ b/{destino}")
-                        new_patch = new_patch.replace(f"diff --git a/{origen} b/{origen}", 
-                                                   f"diff --git a/{destino} b/{destino}")
-                        new_patch = new_patch.replace(f" {origen}", f" {destino}")
-                    
-                    # Escribir nuevo parche y aplicarlo
-                    tmp_path2 = None
-                    try:
-                        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tmpfile2:
-                            tmpfile2.write(new_patch)
-                            tmp_path2 = tmpfile2.name
-                        
-                        # Intento final con opción de rechazo
-                        print(Fore.GREEN + "Intentando aplicar parche con correcciones...")
-                        result = subprocess.run(f"git apply --index --reject {tmp_path2}", shell=True)
-                        
-                        if result.returncode != 0:
-                            # Verificar si se aplicó parcialmente (con rechazos)
-                            reject_files = run("find . -name '*.rej'", allow_fail=True).splitlines()
-                            if reject_files:
-                                print(Fore.YELLOW + f"Parche aplicado parcialmente. {len(reject_files)} archivos con rechazos.")
-                                
-                                # En modo automático, continuar con aplicación parcial
-                                if auto_mode:
-                                    log_message("Modo automático: continuando con aplicación parcial", "WARNING")
-                                    # Eliminar los archivos .rej para limpieza
-                                    for rej_file in reject_files:
-                                        try:
-                                            os.remove(rej_file)
-                                        except:
-                                            pass
-                                else:
-                                    # Preguntar si continuar con aplicación parcial
-                                    continuar = input(Fore.CYAN + "¿Continuar con aplicación parcial? (s/n): ").lower()
-                                    if not continuar.startswith('s'):
-                                        log_message("Aplicación parcial rechazada por el usuario", "ERROR")
-                                        # Limpiar rechazos
-                                        for rej_file in reject_files:
-                                            try:
-                                                os.remove(rej_file)
-                                            except:
-                                                pass
-                                        end_operation_timer(op_key, "failure", "rejected_partial")
-                                        return False
-                                    
-                                    # Eliminar los archivos .rej para limpieza
-                                    for rej_file in reject_files:
-                                        try:
-                                            os.remove(rej_file)
-                                        except:
-                                            pass
-                            else:
-                                log_message("Error al aplicar el parche con las correcciones.", "ERROR")
-                                end_operation_timer(op_key, "failure", "patch_error")
-                                return False
-                    finally:
-                        # Asegurar la limpieza del archivo temporal
-                        if tmp_path2 and os.path.exists(tmp_path2):
-                            try:
-                                os.unlink(tmp_path2)
-                            except:
-                                pass
-                else:
-                    log_message("Proceso de renombrado cancelado por el usuario.", "WARNING")
-                    end_operation_timer(op_key, "cancelled", "user_cancelled")
-                    return False
+        # En este punto, presentamos opciones al usuario como en un cherry-pick normal de git
+        options = [
+            "Resolver conflictos manualmente", 
+            "Intentar manejo automático de archivos renombrados", 
+            "Abortar cherry-pick"
+        ]
+        choice = select_option(options)
+        
+        if choice.startswith("Resolver"):
+            # Resolución manual usando el método de git normal
+            if resume_cherry_pick(conflicted_files):
+                applied_commits.add(commit)  # Marcar como aplicado
+                log_message(f"Conflictos resueltos manualmente para commit {commit}", "SUCCESS")
+                # Limpiar archivo temporal
+                try:
+                    os.unlink(msg_path)
+                except:
+                    pass
+                end_operation_timer(op_key, "success", "manual_resolution")
+                return True
             else:
-                log_message("No se pudieron identificar archivos específicos con problemas.", "ERROR")
-                end_operation_timer(op_key, "failure", "unidentified_error")
+                log_message(f"Falló la resolución manual de conflictos para commit {commit}", "ERROR")
+                end_operation_timer(op_key, "failure", "manual_resolution_failed")
                 return False
-        else:
-            log_message("Parche aplicado correctamente con renombres", "SUCCESS")
-        
-        # Crear commit con los cambios y el mensaje original
-        result = subprocess.run("git diff --cached --quiet", shell=True)
-        if result.returncode != 0:  # Hay cambios
-            # Crear commit con el mensaje original que ya obtuvimos
-            try:
-                # Crear archivo temporal con el mensaje
-                with tempfile.NamedTemporaryFile(mode="w+", delete=False) as msg_file:
-                    msg_file.write(commit_message)
-                    msg_path = msg_file.name
                 
-                # Crear el commit con el mensaje original
-                commit_result = subprocess.run(f"git commit -F {msg_path}", shell=True)
-                os.unlink(msg_path)
-                
-                if commit_result.returncode != 0:
-                    log_message("Error al crear commit con mensaje original. Usando mensaje genérico.", "WARNING")
-                    run(f"git commit -m \"Cherry-pick {commit}\"")
-            except Exception as e:
-                log_message(f"Error al crear commit: {str(e)}", "ERROR")
-                run(f"git commit -m \"Cherry-pick {commit}\"")
-        else:
-            log_message("No hay cambios para hacer commit después de aplicar el parche.", "WARNING")
-            # Crear un commit vacío para mantener la historia
-            with tempfile.NamedTemporaryFile(mode="w+", delete=False) as msg_file:
-                msg_file.write(commit_message)
-                msg_path = msg_file.name
+        elif choice.startswith("Intentar"):
+            # Reiniciar el cherry-pick
+            run("git cherry-pick --abort", allow_fail=True)
             
-            run(f"git commit --allow-empty -F {msg_path}")
-            os.unlink(msg_path)
-    finally:
-        # Asegurar la limpieza del archivo temporal principal
-        if tmp_path and os.path.exists(tmp_path):
+            # Intentar con método de renombres
+            handled = ask_file_renames_from_errors(conflicted_files)
+            
+            # Limpiar archivo temporal
             try:
-                os.unlink(tmp_path)
+                os.unlink(msg_path)
             except:
                 pass
+                
+            if handled:
+                # Si los renombres fueron manejados, continuar con el proceso de parche
+                log_message("Renombres establecidos. Intentando con método de parche.", "INFO")
+                # Continuamos el flujo para usar el método de parche
+            else:
+                log_message("Proceso de renombrado cancelado. Abortando cherry-pick.", "WARNING")
+                end_operation_timer(op_key, "cancelled", "user_cancelled")
+                return False
+        else:
+            # Abortar cherry-pick
+            run("git cherry-pick --abort", allow_fail=True)
+            
+            # Limpiar archivo temporal
+            try:
+                os.unlink(msg_path)
+            except:
+                pass
+                
+            log_message(f"Cherry-pick abortado para commit {commit}.", "WARNING")
+            end_operation_timer(op_key, "aborted", "user_aborted")
+            return False
     
-    # Marcar como exitoso y guardar estadísticas
-    end_operation_timer(op_key, "success", "rename_handling")
-    log_message(f"Commit {commit} aplicado exitosamente con manejo de renombres.", "SUCCESS")
-    save_file_renames()  # Guardar renombres para futuros commits
-    return True
+    # Si no hay conflictos pero el cherry-pick falló por alguna otra razón, intentar con el
+    # método de parche
+    log_message("Cherry-pick falló sin conflictos detectados. Intentando método alternativo.", "WARNING")
+    run("git cherry-pick --abort", allow_fail=True)
+    
+    # Para archivos eliminados en HEAD pero modificados en el commit, intentar recrearlos
+    for origen, destino in file_renames.items():
+        if destino == "/dev/null":
+            log_message(f"Ignorando archivo eliminado: {origen}", "INFO")
+            continue
+            
+        if not os.path.exists(origen) and os.path.exists(destino):
+            log_message(f"Creando enlace para renombre: {origen} -> {destino}", "INFO")
+            try:
+                # Crear directorio si no existe
+                os.makedirs(os.path.dirname(origen), exist_ok=True)
+                
+                # Enlazar o copiar
+                if os.name == 'posix':
+                    run(f"ln -sf {destino} {origen}", allow_fail=True)
+                else:
+                    import shutil
+                    shutil.copy2(destino, origen)
+            except Exception as e:
+                log_message(f"Error al crear enlace: {str(e)}", "ERROR")
+    
+    # Intentar nuevo cherry-pick con opciones que permitan conflictos y no hagan commit automáticamente
+    cherry_result = run(f"git cherry-pick --no-commit {commit_ref} 2>&1", allow_fail=True)
+    
+    # Verificar si hay contenido modificado
+    if "nothing to commit" in cherry_result:
+        log_message("El commit no contiene cambios aplicables. Marcando como aplicado.", "WARNING")
+        applied_commits.add(commit)
+        end_operation_timer(op_key, "success", "no_changes")
+        return True
+    
+    # Verificar si hay archivos con conflictos ahora
+    has_conflicts = "CONFLICT" in cherry_result or "error: could not apply" in cherry_result
+    conflicted_files = run("git diff --name-only --diff-filter=U", allow_fail=True).splitlines()
+    
+    if has_conflicts and conflicted_files:
+        print(Fore.RED + f"error: could not apply {commit[:10]}... {message.splitlines()[0]}")
+        print(Fore.YELLOW + "hint: After resolving the conflicts, mark them with")
+        print(Fore.YELLOW + "hint: \"git add/rm <pathspec>\", then run")
+        print(Fore.YELLOW + "hint: \"git cherry-pick --continue\".")
+        
+        print(Fore.RED + f"\nConflictos en archivos después de aplicar renombres ({len(conflicted_files)}):")
+        for file in conflicted_files:
+            print(Fore.RED + f" - {file}")
+            
+        # Ofrecer resolver conflictos manualmente
+        if auto_mode or input(Fore.CYAN + "¿Resolver conflictos manualmente? (s/n): ").lower().startswith('s'):
+            if resume_cherry_pick(conflicted_files):
+                applied_commits.add(commit)  # Marcar como aplicado
+                log_message(f"Conflictos resueltos manualmente para commit {commit}", "SUCCESS")
+                end_operation_timer(op_key, "success", "manual_resolution")
+                return True
+            else:
+                log_message(f"Falló la resolución manual de conflictos para commit {commit}", "ERROR")
+                end_operation_timer(op_key, "failure", "manual_resolution_failed")
+                return False
+        else:
+            run("git cherry-pick --abort", allow_fail=True)
+            log_message("Resolución de conflictos cancelada por el usuario", "WARNING")
+            end_operation_timer(op_key, "cancelled", "user_cancelled")
+            return False
+    
+    # Si no hay conflictos pero hay cambios, hacer commit con el mensaje original
+    result = subprocess.run("git diff --cached --quiet", shell=True)
+    if result.returncode != 0:  # Hay cambios
+        # Obtener mensaje original
+        try:
+            # Crear commit usando el mensaje original
+            with tempfile.NamedTemporaryFile(mode="w+", delete=False) as msg_file:
+                msg_file.write(message)
+                msg_file_path = msg_file.name
+            
+            commit_result = subprocess.run(f"git commit -F {msg_file_path}", shell=True)
+            os.unlink(msg_file_path)
+            
+            if commit_result.returncode != 0:
+                # Fallback con mensaje simple
+                log_message("Error al crear commit con mensaje original. Usando mensaje simple.", "WARNING")
+                subprocess.run(f"git commit -m \"Cherry-pick {commit}\"", shell=True)
+            
+            applied_commits.add(commit)  # Marcar como aplicado
+            log_message(f"Commit {commit} aplicado exitosamente con los renombres.", "SUCCESS")
+            end_operation_timer(op_key, "success", "renamed_success")
+            return True
+        except Exception as e:
+            log_message(f"Error al crear commit: {str(e)}", "ERROR")
+            subprocess.run(f"git commit -m \"Cherry-pick {commit}\"", shell=True)
+            applied_commits.add(commit)  # Marcar como aplicado
+            end_operation_timer(op_key, "success", "renamed_success_fallback")
+            return True
+    else:
+        log_message("No hay cambios para hacer commit después de aplicar los renombres.", "WARNING")
+        applied_commits.add(commit)  # Marcar como aplicado
+        end_operation_timer(op_key, "success", "no_changes")
+        return True
 
 
 
