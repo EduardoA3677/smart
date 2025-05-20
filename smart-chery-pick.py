@@ -1571,40 +1571,76 @@ def handle_missing_file(missing_file, adding_commit, current_commit):
 def ask_file_renames_from_errors(failed_files):
     """
     Permite al usuario especificar rutas correctas para archivos que fallaron durante un cherry-pick.
+    Maneja especialmente el caso de archivos eliminados en HEAD pero modificados en el commit.
     """
     if not failed_files:
         log_message("No hay archivos con problemas para renombrar.", "INFO")
         return False
+    
+    # Detectar archivos con conflictos modify/delete
+    git_status = run("git status", allow_fail=True)
+    modify_delete_files = []
+    for archivo in failed_files:
+        if f"{archivo} deleted in HEAD" in git_status or f"CONFLICT (modify/delete): {archivo}" in git_status:
+            modify_delete_files.append(archivo)
+    
+    has_modify_delete = len(modify_delete_files) > 0
+    if has_modify_delete:
+        log_message(f"Detectados {len(modify_delete_files)} archivos con conflicto modify/delete", "INFO")
         
     # Para modo automático
     if auto_mode:
-        log_message("Modo automático: buscando archivos similares para ruta automática", "INFO")
+        log_message("Modo automático: intentando resolver conflictos de archivos", "INFO")
         rename_count = 0
         
         for archivo in failed_files:
-            # Intentar buscar un archivo similar en el repositorio
-            similar_files = find_similar_files(archivo)
-            if similar_files and similar_files[0][1] > 70:  # Si hay un archivo similar con score > 70%
-                file_renames[archivo] = similar_files[0][0]
-                log_message(f"Mapeo automático: {archivo} -> {similar_files[0][0]} (similitud: {similar_files[0][1]}%)", "INFO")
-                rename_count += 1
+            if archivo in modify_delete_files:
+                # Si el archivo fue eliminado en HEAD pero modificado en el commit, recrearlo
+                try:
+                    # Intentar obtener contenido del archivo desde el commit a aplicar (MERGE_HEAD)
+                    content = run(f"git show MERGE_HEAD:{archivo}", allow_fail=True)
+                    if content:
+                        # Crear directorios si es necesario
+                        os.makedirs(os.path.dirname(archivo), exist_ok=True)
+                        # Escribir el archivo
+                        with open(archivo, "w") as f:
+                            f.write(content)
+                        run(f"git add {archivo}", allow_fail=True)
+                        log_message(f"Archivo recreado automáticamente: {archivo}", "INFO")
+                        rename_count += 1
+                    else:
+                        log_message(f"No se pudo obtener contenido para {archivo}", "WARNING")
+                except Exception as e:
+                    log_message(f"Error al recrear archivo {archivo}: {str(e)}", "ERROR")
+            else:
+                # Para el resto de archivos, intentar buscar similares
+                similar_files = find_similar_files(archivo)
+                if similar_files and similar_files[0][1] > 70:  # Si hay un archivo similar con score > 70%
+                    file_renames[archivo] = similar_files[0][0]
+                    log_message(f"Mapeo automático: {archivo} -> {similar_files[0][0]} (similitud: {similar_files[0][1]}%)", "INFO")
+                    rename_count += 1
+        
+        save_file_renames()  # Guardar siempre los renombres, incluso parciales
         
         if rename_count == len(failed_files):
-            save_file_renames()  # Guardar los renombres
+            log_message(f"Se resolvieron automáticamente todos los {len(failed_files)} archivos", "SUCCESS")
             return True
         elif rename_count > 0:
-            log_message(f"Se renombraron automáticamente {rename_count} de {len(failed_files)} archivos", "INFO")
+            log_message(f"Se resolvieron automáticamente {rename_count} de {len(failed_files)} archivos", "INFO")
             # Intentamos con los que se encontraron, tal vez es suficiente
             return True
+        else:
+            log_message("No se pudo resolver ningún archivo automáticamente", "WARNING")
             
     # Modo interactivo para usuario
     while True:
-        print(Fore.RED + "\nCherry-pick fallido. Posibles errores por renombre de archivos:")
+        print(Fore.RED + "\nCherry-pick fallido. Posibles errores por archivos con conflictos:")
         
         # Mostrar archivos con problemas
         for i, archivo in enumerate(failed_files, 1):
             ruta_actual = file_renames.get(archivo, archivo)
-            print(Fore.YELLOW + f"{i}. {ruta_actual}")
+            tipo = "(modify/delete)" if archivo in modify_delete_files else ""
+            print(Fore.YELLOW + f"{i}. {ruta_actual} {tipo}")
         
         # Opciones adicionales
         terminar_opcion = len(failed_files) + 1
@@ -1617,8 +1653,8 @@ def ask_file_renames_from_errors(failed_files):
         
         # Verificar si el usuario quiere terminar
         if opcion == str(terminar_opcion):
-            # Verificar que al menos un archivo haya sido renombrado
-            if any(archivo in file_renames for archivo in failed_files):
+            # Verificar que al menos un archivo haya sido renombrado o manejado
+            if any(archivo in file_renames for archivo in failed_files) or len(modify_delete_files) > 0:
                 save_file_renames()  # Guardar los cambios
                 return True
             else:
@@ -1626,7 +1662,7 @@ def ask_file_renames_from_errors(failed_files):
                 if continuar.startswith('s'):
                     return True
                 else:
-                    continue
+                    continue  # Volver al bucle principal
         
         # Verificar si el usuario quiere cancelar
         if opcion == str(cancelar_opcion):
@@ -1639,12 +1675,62 @@ def ask_file_renames_from_errors(failed_files):
                 archivo = failed_files[idx - 1]
                 ruta_actual = file_renames.get(archivo, archivo)
                 
-                # Mostrar archivos similares como sugerencia
+                # Caso especial para archivos modify/delete
+                if archivo in modify_delete_files:
+                    print(Fore.CYAN + f"\nArchivo '{archivo}' fue eliminado en HEAD pero modificado en el commit.")
+                    opciones = [
+                        "Recrear el archivo con el contenido del commit",
+                        "Ignorar los cambios del commit (mantener eliminado)",
+                        "Especificar un archivo equivalente",
+                        "Volver al menú principal"
+                    ]
+                    sel = select_option(opciones, "¿Qué deseas hacer? ")
+                    
+                    if sel.startswith("Recrear"):
+                        try:
+                            # Intentar obtener contenido del archivo desde el commit a aplicar
+                            content = run(f"git show MERGE_HEAD:{archivo}", allow_fail=True)
+                            if content:
+                                # Crear directorios si es necesario
+                                os.makedirs(os.path.dirname(archivo), exist_ok=True)
+                                # Escribir el archivo
+                                with open(archivo, "w") as f:
+                                    f.write(content)
+                                run(f"git add {archivo}", allow_fail=True)
+                                log_message(f"Archivo recreado: {archivo}", "SUCCESS")
+                            else:
+                                log_message(f"No se pudo obtener contenido para {archivo}", "ERROR")
+                        except Exception as e:
+                            log_message(f"Error al recrear archivo {archivo}: {str(e)}", "ERROR")
+                    elif sel.startswith("Ignorar"):
+                        # No hacer nada, dejarlo eliminado
+                        run(f"git rm {archivo}", allow_fail=True)
+                        log_message(f"Ignorando cambios en archivo eliminado: {archivo}", "INFO")
+                    elif sel.startswith("Especificar"):
+                        nueva_ruta = input(Fore.CYAN + f"Ingrese la ruta de un archivo equivalente para '{archivo}': ").strip()
+                        if nueva_ruta:
+                            file_renames[archivo] = nueva_ruta
+                            log_message(f"Renombramiento configurado: {archivo} -> {nueva_ruta}", "INFO")
+                    continue
+                
+                # Mostrar archivos similares como sugerencia para archivos normales
                 similar_files = find_similar_files(archivo)
                 if similar_files:
                     print(Fore.CYAN + "\nArchivos similares encontrados:")
-                    for i, (similar_path, score) in enumerate(similar_files[:3], 1):
+                    for i, (similar_path, score) in enumerate(similar_files[:5], 1):
                         print(Fore.CYAN + f"  {i}. {similar_path} (similitud: {score}%)")
+                    
+                    # Permitir selección directa de archivo similar
+                    select_similar = input(Fore.CYAN + "¿Seleccionar un archivo similar por número o ingresar ruta manualmente? (número/m): ").strip()
+                    try:
+                        similar_idx = int(select_similar)
+                        if 1 <= similar_idx <= len(similar_files[:5]):
+                            file_renames[archivo] = similar_files[similar_idx-1][0]
+                            log_message(f"Renombramiento configurado: {archivo} -> {similar_files[similar_idx-1][0]}", "INFO")
+                            continue
+                    except ValueError:
+                        # No es un número, seguimos con entrada manual
+                        pass
                 
                 # Solicitar nueva ruta
                 nueva_ruta = input(Fore.CYAN + f"Ingrese la ruta correcta para '{ruta_actual}' (vacío para mantener): ").strip()
@@ -1663,6 +1749,7 @@ def ask_file_renames_from_errors(failed_files):
 def apply_patch_with_rename_handling(commit):
     """
     Aplica un cherry-pick manejando renombres de archivos especificados en file_renames.
+    También maneja casos especiales como archivos eliminados en HEAD pero modificados en el commit.
     Genera un parche a partir del commit y lo modifica antes de aplicarlo.
     """
     op_key = start_operation_timer(commit, "patch_rename_handling")
@@ -1685,17 +1772,52 @@ def apply_patch_with_rename_handling(commit):
     
     # Verificar qué archivos se ven afectados
     affected_files = []
+    deleted_files = []
+    modified_files = []
+    
+    # Identificar archivos afectados y sus estados
     for line in patch.splitlines():
-        if line.startswith("--- a/") or line.startswith("+++ b/"):
+        if line.startswith("--- a/"):
             path = line[6:].strip()
-            if path and path != "/dev/null" and path not in affected_files:
+            if path != "/dev/null" and path not in affected_files:
+                affected_files.append(path)
+                
+                # Verificar si el archivo existe en el índice actual
+                exists = run(f"git ls-files --error-unmatch {path} 2>/dev/null || echo 'NOT_EXISTS'", allow_fail=True)
+                if exists.strip() == "NOT_EXISTS":
+                    deleted_files.append(path)
+                else:
+                    modified_files.append(path)
+                    
+        elif line.startswith("+++ b/"):
+            path = line[6:].strip()
+            if path != "/dev/null" and path not in affected_files:
                 affected_files.append(path)
     
     log_message(f"Commit afecta a {len(affected_files)} archivos", "INFO")
+    if deleted_files:
+        log_message(f"Archivos eliminados en HEAD pero modificados en commit: {len(deleted_files)}", "INFO")
+    
+    # Intentar recrear archivos eliminados automáticamente si es necesario
+    for file_path in deleted_files:
+        try:
+            # Intentar obtener contenido del archivo desde el commit
+            content = run(f"git show {commit_ref}:{file_path}", allow_fail=True)
+            if content:
+                # Crear directorios si es necesario
+                os.makedirs(os.path.dirname(file_path), exist_ok=True)
+                # Escribir el archivo
+                with open(file_path, 'w') as f:
+                    f.write(content)
+                # Añadir al índice
+                run(f"git add {file_path}", allow_fail=True)
+                log_message(f"Archivo recreado desde commit: {file_path}", "INFO")
+        except Exception as e:
+            log_message(f"Error al recrear archivo eliminado {file_path}: {str(e)}", "ERROR")
     
     # Buscar y aplicar renombres automáticamente si es necesario
     for file_path in affected_files:
-        if file_path not in file_renames and not os.path.exists(file_path):
+        if file_path not in file_renames and file_path not in deleted_files and not os.path.exists(file_path):
             similar_files = find_similar_files(file_path)
             if similar_files and similar_files[0][1] > 80:  # Alta similitud (80%)
                 file_renames[file_path] = similar_files[0][0]
@@ -1718,8 +1840,13 @@ def apply_patch_with_rename_handling(commit):
         tmpfile.write(modified_patch)
         tmpfile_path = tmpfile.name
     
-    # Intentar aplicar el parche modificado
-    result = subprocess.run(f"git apply --index {tmpfile_path}", shell=True)
+    # Intentar aplicar el parche modificado con opciones más tolerantes
+    apply_options = "--3way --index"  # Use 3-way merge para mejor manejo de conflictos
+    if deleted_files:
+        apply_options += " --allow-empty"  # Permitir parches vacíos
+    
+    log_message(f"Aplicando parche con opciones: {apply_options}", "INFO")
+    result = subprocess.run(f"git apply {apply_options} {tmpfile_path}", shell=True)
     
     if result.returncode != 0:
         # Análisis de fallo
@@ -1738,6 +1865,56 @@ def apply_patch_with_rename_handling(commit):
                         sub_file = sub_file.strip()
                         if sub_file and sub_file not in failed_files:
                             failed_files.append(sub_file)
+        
+        # Intento alternativo directo: recrear archivos modificados del commit
+        if failed_files and all(f in deleted_files for f in failed_files):
+            log_message("Intentando método alternativo para archivos eliminados en HEAD", "INFO")
+            # Limpiar cualquier cambio parcial
+            run("git reset --hard", allow_fail=True)
+            
+            # Para cada archivo fallido, extraer su contenido completo del commit y recrearlo
+            success = True
+            for file_path in failed_files:
+                try:
+                    # Extraer el contenido completo del archivo en el commit
+                    content = run(f"git show {commit_ref}:{file_path}", allow_fail=True)
+                    if not content:
+                        log_message(f"No se pudo obtener contenido para {file_path}", "ERROR")
+                        success = False
+                        continue
+                        
+                    # Crear directorios si no existen
+                    directory = os.path.dirname(file_path)
+                    if directory and not os.path.exists(directory):
+                        os.makedirs(directory, exist_ok=True)
+                    
+                    # Escribir el archivo completo
+                    with open(file_path, 'w') as f:
+                        f.write(content)
+                    
+                    # Añadir al índice
+                    run(f"git add {file_path}", allow_fail=True)
+                    log_message(f"Archivo recreado exitosamente: {file_path}", "SUCCESS")
+                except Exception as e:
+                    log_message(f"Error al recrear archivo {file_path}: {str(e)}", "ERROR")
+                    success = False
+            
+            if success:
+                # Commit explícito con mensaje del commit original
+                message = run(f"git log -1 --pretty=format:%B {commit_ref}").strip()
+                with tempfile.NamedTemporaryFile(mode="w+", delete=False) as msg_file:
+                    msg_file.write(message)
+                    msg_file_path = msg_file.name
+                
+                commit_result = subprocess.run(f"git commit -F {msg_file_path}", shell=True)
+                os.unlink(msg_file_path)
+                
+                if commit_result.returncode == 0:
+                    log_message("Commit aplicado mediante recreación de archivos eliminados", "SUCCESS")
+                    end_operation_timer(op_key, "success", "recreate_files")
+                    return True
+                else:
+                    log_message("Error al crear commit después de recrear archivos", "ERROR")
         
         # Limpiar archivo temporal
         os.unlink(tmpfile_path)
@@ -1767,9 +1944,9 @@ def apply_patch_with_rename_handling(commit):
                     tmpfile2.write(new_patch)
                     tmpfile_path2 = tmpfile2.name
                 
-                # Intento final
+                # Intento final con opciones más permisivas
                 print(Fore.GREEN + "Intentando aplicar parche con correcciones...")
-                result = subprocess.run(f"git apply --index --reject {tmpfile_path2}", shell=True)
+                result = subprocess.run(f"git apply --3way --allow-empty --reject {apply_options} {tmpfile_path2}", shell=True)
                 os.unlink(tmpfile_path2)
                 
                 if result.returncode != 0:
